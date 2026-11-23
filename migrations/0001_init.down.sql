@@ -1,0 +1,9 @@
+DROP TABLE IF EXISTS confirmation_tokens;
+DROP TABLE IF EXISTS curation_decisions;
+DROP TABLE IF EXISTS memory_edges;
+DROP TABLE IF EXISTS memory_citations;
+DROP TABLE IF EXISTS memory_revisions;
+DROP TABLE IF EXISTS memory_manifest;
+DROP TABLE IF EXISTS raw_inbox;
+DROP TABLE IF EXISTS workspaces;
+DROP TABLE IF EXISTS schema_migrations;

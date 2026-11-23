@@ -1,0 +1,5 @@
+bin/
+coverage.out
+eval/datasets/*.jsonl
+eval/datasets/*.json
+eval/datasets/*.parquet
