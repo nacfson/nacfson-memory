@@ -1007,4 +1007,30 @@ func TestStorageEdgePathsPaginationAndJobs(t *testing.T) {
 	if err := etx.Commit(ctx); err != nil {
 		t.Fatalf("commit etx: %v", err)
 	}
+
+	// Verify ResetProvisionalToPending resets 'general' provisional inbox items (no working manifest row).
+	genRes, err := store.InsertInboxAndEnqueueTx(ctx, storage.InsertInboxParams{
+		WorkspaceID: storage.WorkspaceGeneral,
+		AgentID:     "test-agent",
+		Content:     "User lives in Seoul.",
+	})
+	if err != nil {
+		t.Fatalf("insert general inbox: %v", err)
+	}
+	rtx, err := store.CurationPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin rtx: %v", err)
+	}
+	defer func() { _ = rtx.Rollback(ctx) }()
+	if _, err := storage.MarkInboxProvisional(ctx, rtx, storage.WorkspaceGeneral, []uuid.UUID{genRes.InboxID}); err != nil {
+		t.Fatalf("mark general provisional: %v", err)
+	}
+	wss, cnt, err := storage.ResetProvisionalToPending(ctx, rtx, 10)
+	if err != nil || cnt != 1 || len(wss) != 1 || wss[0] != storage.WorkspaceGeneral {
+		t.Fatalf("expected ResetProvisionalToPending to reset general row, got wss=%v cnt=%d err=%v", wss, cnt, err)
+	}
+	var st string
+	if err := rtx.QueryRow(ctx, `SELECT status FROM raw_inbox WHERE inbox_id = $1`, genRes.InboxID).Scan(&st); err != nil || st != "pending" {
+		t.Fatalf("expected general inbox status=pending after reset, got %q err=%v", st, err)
+	}
 }

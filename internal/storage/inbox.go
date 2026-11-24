@@ -262,32 +262,27 @@ func MarkInboxDeadLetter(ctx context.Context, db DBTX, workspaceID string, inbox
 	return nil
 }
 
-// ResetProvisionalToPending resets cited raw_inbox rows for the oldest active provisional
-// manifest entries back to 'pending' and returns the affected workspace IDs and row count.
+// ResetProvisionalToPending resets up to limit oldest 'provisional' raw_inbox rows
+// (including 'general' rows that have no working manifest entry) back to 'pending'
+// and returns the affected workspace IDs and row count.
 func ResetProvisionalToPending(ctx context.Context, tx pgx.Tx, limit int) ([]string, int64, error) {
 	if limit <= 0 {
 		limit = 10
 	}
 
 	rows, err := tx.Query(ctx, `
-		WITH target_manifests AS (
-			SELECT memory_id
-			FROM memory_manifest
-			WHERE curation_state = 'provisional_heuristic'
-			  AND status = 'active'
-			ORDER BY updated_at ASC
+		WITH target_inbox AS (
+			SELECT inbox_id
+			FROM raw_inbox
+			WHERE status = 'provisional'
+			ORDER BY occurred_at ASC, ingested_at ASC, inbox_id ASC
 			LIMIT $1
-		),
-		target_inbox AS (
-			SELECT DISTINCT mc.inbox_id
-			FROM memory_citations mc
-			JOIN target_manifests tm ON tm.memory_id = mc.memory_id
+			FOR UPDATE SKIP LOCKED
 		)
 		UPDATE raw_inbox r
 		SET status = 'pending'
 		FROM target_inbox ti
 		WHERE r.inbox_id = ti.inbox_id
-		  AND r.status = 'provisional'
 		RETURNING r.workspace_id
 	`, limit)
 	if err != nil {

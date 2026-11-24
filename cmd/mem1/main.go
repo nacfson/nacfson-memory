@@ -1,24 +1,37 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/riverqueue/river"
+	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 
 	"github.com/nacfson/nacfson-memory/eval"
 	"github.com/nacfson/nacfson-memory/internal/config"
 	"github.com/nacfson/nacfson-memory/internal/curation"
 	"github.com/nacfson/nacfson-memory/internal/embedding"
 	"github.com/nacfson/nacfson-memory/internal/graph"
+	"github.com/nacfson/nacfson-memory/internal/httpapi"
+	"github.com/nacfson/nacfson-memory/internal/mcpserver"
 	"github.com/nacfson/nacfson-memory/internal/retrieval"
+	"github.com/nacfson/nacfson-memory/internal/search"
 	"github.com/nacfson/nacfson-memory/internal/security"
 	"github.com/nacfson/nacfson-memory/internal/service"
 	"github.com/nacfson/nacfson-memory/internal/storage"
@@ -38,12 +51,28 @@ func run(args []string, stdout, stderr io.Writer) int {
 	defer stop()
 
 	switch args[0] {
+	case "serve":
+		return runServe(ctx, args[1:], stderr)
+	case "mcp-stdio":
+		return runMCPStdio(ctx, args[1:], stderr)
 	case "migrate":
 		return runMigrate(ctx, args[1:], stdout, stderr)
 	case "reindex":
 		return runReindex(ctx, args[1:], stdout, stderr)
 	case "eval":
 		return runEval(ctx, args[1:], stdout, stderr)
+	case "list":
+		return runList(ctx, args[1:], stdout, stderr)
+	case "explain":
+		return runExplain(ctx, args[1:], stdout, stderr)
+	case "revert":
+		return runRevert(ctx, args[1:], stdout, stderr)
+	case "purge":
+		return runPurge(ctx, args[1:], stdout, stderr)
+	case "confirm-token":
+		return runConfirmToken(ctx, args[1:], stdout, stderr)
+	case "dead-letters":
+		return runDeadLetters(ctx, args[1:], stdout, stderr)
 	case "-h", "--help", "help":
 		printUsage(stdout)
 		return 0
@@ -52,6 +81,162 @@ func run(args []string, stdout, stderr io.Writer) int {
 		printUsage(stderr)
 		return 2
 	}
+}
+
+func runServe(ctx context.Context, args []string, stderr io.Writer) int {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	cfg, err := config.Load(config.ModeServe)
+	if err != nil {
+		fmt.Fprintf(stderr, "config error: %v\n", err)
+		return 1
+	}
+
+	cur, err := buildCurator(cfg)
+	if err != nil {
+		fmt.Fprintf(stderr, "curator init failed: %v\n", err)
+		return 1
+	}
+	emb, err := buildEmbedder(cfg)
+	if err != nil {
+		fmt.Fprintf(stderr, "embedder init failed: %v\n", err)
+		return 1
+	}
+
+	store, err := storage.OpenPools(ctx, cfg)
+	if err != nil {
+		fmt.Fprintf(stderr, "database open failed: %v\n", err)
+		return 1
+	}
+	defer store.Close()
+
+	logger := slog.New(slog.NewJSONHandler(stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	svc, lx, dg, curBreaker, embBreaker := buildRuntimeService(cfg, store, emb)
+
+	workers := river.NewWorkers()
+	curation.RegisterWorkers(workers, curation.WorkerDeps{
+		Store:             store,
+		Curator:           cur,
+		Embedder:          emb,
+		Lexical:           lx,
+		Graph:             dg,
+		CuratorBreaker:    curBreaker,
+		EmbedderBreaker:   embBreaker,
+		HistoryRetentionN: cfg.HistoryRetentionN,
+		CurationPaused:    func() bool { return cfg.CurationPaused },
+		ForceProvisional:  func() bool { return cfg.ForceProvisional },
+		Logger:            logger,
+	})
+	riverClient, err := river.NewClient(riverpgxv5.New(store.CurationPool), &river.Config{
+		Queues:       storage.RiverQueues(),
+		Workers:      workers,
+		PeriodicJobs: curation.PeriodicJobs(),
+		Logger:       logger,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "river client init failed: %v\n", err)
+		return 1
+	}
+	if err := riverClient.Start(ctx); err != nil {
+		fmt.Fprintf(stderr, "river worker start failed: %v\n", err)
+		return 1
+	}
+
+	mcpHandler := mcpserver.NewStreamableHTTPHandler(svc, logger)
+	srv := httpapi.NewServer(cfg, svc, mcpHandler, logger)
+
+	ln, err := net.Listen("tcp", cfg.HTTPAddr)
+	if err != nil {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = riverClient.Stop(stopCtx)
+		cancel()
+		fmt.Fprintf(stderr, "listen %q failed: %v\n", cfg.HTTPAddr, err)
+		return 1
+	}
+
+	logger.Info("mem1 serve listening", "addr", ln.Addr().String())
+	serveErrCh := make(chan error, 1)
+	go func() {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErrCh <- err
+			return
+		}
+		serveErrCh <- nil
+	}()
+
+	var exitCode int
+	select {
+	case <-ctx.Done():
+	case err := <-serveErrCh:
+		if err != nil {
+			fmt.Fprintf(stderr, "http server failed: %v\n", err)
+			exitCode = 1
+		}
+	}
+
+	shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutCancel()
+	if err := srv.Shutdown(shutCtx); err != nil {
+		fmt.Fprintf(stderr, "http shutdown error: %v\n", err)
+		exitCode = 1
+	}
+	riverStopCtx, riverStopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer riverStopCancel()
+	if err := riverClient.Stop(riverStopCtx); err != nil {
+		fmt.Fprintf(stderr, "river shutdown error: %v\n", err)
+		exitCode = 1
+	}
+	return exitCode
+}
+
+func runMCPStdio(ctx context.Context, args []string, stderr io.Writer) int {
+	fs := flag.NewFlagSet("mcp-stdio", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	cfg, err := config.Load(config.ModeMCPStdio)
+	if err != nil {
+		fmt.Fprintf(stderr, "config error: %v\n", err)
+		return 1
+	}
+	emb, err := buildEmbedder(cfg)
+	if err != nil {
+		fmt.Fprintf(stderr, "embedder init failed: %v\n", err)
+		return 1
+	}
+	store, err := storage.OpenPools(ctx, cfg)
+	if err != nil {
+		fmt.Fprintf(stderr, "database open failed: %v\n", err)
+		return 1
+	}
+	defer store.Close()
+
+	// Logs must stay strictly on stderr so stdout remains clean JSON-RPC stdio framing.
+	logger := slog.New(slog.NewJSONHandler(stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	svc, _, _, _, _ := buildRuntimeService(cfg, store, emb)
+
+	if err := mcpserver.RunStdio(ctx, svc, logger); err != nil && !errors.Is(err, context.Canceled) {
+		fmt.Fprintf(stderr, "mcp-stdio failed: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func buildRuntimeService(cfg config.Config, store *storage.Store, emb embedding.Embedder) (*service.MemoryService, *search.LexicalSearch, *graph.DependencyGraph, *curation.Breaker, *curation.Breaker) {
+	lx := search.NewLexicalSearch()
+	dg := graph.NewDependencyGraph()
+	scrubber := security.NewSecretScrubber()
+	curBreaker := curation.NewBreaker(3, 60*time.Second)
+	embBreaker := curation.NewBreaker(3, 60*time.Second)
+	packer := retrieval.NewPacker(store, emb, embBreaker, lx, dg, cfg.EmbedTimeout)
+	svc := service.New(cfg, store, scrubber, emb, packer, dg, curBreaker, embBreaker)
+	return svc, lx, dg, curBreaker, embBreaker
 }
 
 func runMigrate(ctx context.Context, args []string, stdout, stderr io.Writer) int {
@@ -248,6 +433,284 @@ func runEval(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+func runList(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("list", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	workspace := fs.String("workspace", "", "filter by workspace_id")
+	durability := fs.String("durability", "", "filter by durability (constitution|durable|working)")
+	status := fs.String("status", "", "filter by status (active|superseded|retired)")
+	curationState := fs.String("curation-state", "", "filter by curation_state")
+	premiseDrifted := fs.String("premise-drifted", "", "filter by premise_drifted (true|false)")
+	includeRevisions := fs.Bool("include-revisions", false, "include revision history per memory")
+	cursor := fs.String("cursor", "", "pagination cursor")
+	limit := fs.Int("limit", 100, "page size limit")
+	asJSON := fs.Bool("json", false, "output raw JSON")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *limit < 1 {
+		fmt.Fprintln(stderr, "list failed: --limit must be >= 1")
+		return 2
+	}
+
+	q := url.Values{}
+	if *workspace != "" {
+		q.Set("workspace_id", *workspace)
+	}
+	if *durability != "" {
+		q.Set("durability", *durability)
+	}
+	if *status != "" {
+		q.Set("status", *status)
+	}
+	if *curationState != "" {
+		q.Set("curation_state", *curationState)
+	}
+	if *premiseDrifted != "" {
+		q.Set("premise_drifted", *premiseDrifted)
+	}
+	if *includeRevisions {
+		q.Set("include_revisions", "true")
+	}
+	if *cursor != "" {
+		q.Set("cursor", *cursor)
+	}
+	q.Set("limit", strconv.Itoa(*limit))
+
+	var page storage.ListMemoriesPage
+	if code := callAdminJSON(ctx, http.MethodGet, "/v1/memories?"+q.Encode(), nil, &page, stderr); code != 0 {
+		return code
+	}
+	if *asJSON {
+		return writeJSON(stdout, stderr, page)
+	}
+	for _, it := range page.Items {
+		drift := ""
+		if it.PremiseDrifted {
+			drift = " [DRIFTED]"
+		}
+		fmt.Fprintf(stdout, "%s  %-14s  %-12s  %-10s  v%-2d  %-28s  %s%s\n",
+			it.MemoryID, it.WorkspaceID, it.Durability, it.Status, it.CurrentVersion, it.TopicKey, it.SummaryStub, drift)
+	}
+	if page.NextCursor != "" {
+		fmt.Fprintf(stdout, "next_cursor: %s\n", page.NextCursor)
+	}
+	return 0
+}
+
+func runExplain(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("explain", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	idFlag := fs.String("id", "", "memory UUID to inspect")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	id, ok := parseRequiredUUIDFlag(*idFlag, "explain", stderr)
+	if !ok {
+		return 2
+	}
+
+	var raw json.RawMessage
+	if code := callAdminJSON(ctx, http.MethodGet, "/v1/memories/"+id.String()+"/explain", nil, &raw, stderr); code != 0 {
+		return code
+	}
+	return writeJSON(stdout, stderr, raw)
+}
+
+func runRevert(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("revert", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	idFlag := fs.String("id", "", "memory UUID to revert")
+	toVersion := fs.Int("to-version", 0, "target historical version to restore")
+	expectedVersion := fs.Int("expected-version", 0, "current manifest version for CAS check")
+	reason := fs.String("reason", "", "audit reason for rollback")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	id, ok := parseRequiredUUIDFlag(*idFlag, "revert", stderr)
+	if !ok {
+		return 2
+	}
+	if *toVersion < 1 || *expectedVersion < 1 {
+		fmt.Fprintln(stderr, "revert failed: --to-version >= 1 and --expected-version >= 1 are required")
+		return 2
+	}
+
+	var res json.RawMessage
+	if code := callAdminJSON(ctx, http.MethodPost, "/v1/memories/"+id.String()+"/revert", map[string]any{
+		"expected_version": *expectedVersion,
+		"target_version":   *toVersion,
+		"reason":           *reason,
+	}, &res, stderr); code != 0 {
+		return code
+	}
+	return writeJSON(stdout, stderr, res)
+}
+
+func runPurge(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("purge", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	idFlag := fs.String("id", "", "memory UUID to purge")
+	yes := fs.Bool("yes", false, "confirm irreversible hard purge")
+	reason := fs.String("reason", "", "audit reason for purge")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	id, ok := parseRequiredUUIDFlag(*idFlag, "purge", stderr)
+	if !ok {
+		return 2
+	}
+	if !*yes {
+		fmt.Fprintln(stderr, "purge failed: --yes confirmation flag is required")
+		return 2
+	}
+
+	var res json.RawMessage
+	if code := callAdminJSON(ctx, http.MethodPost, "/v1/memories/"+id.String()+"/purge", map[string]any{
+		"confirm": true,
+		"reason":  *reason,
+	}, &res, stderr); code != 0 {
+		return code
+	}
+	return writeJSON(stdout, stderr, res)
+}
+
+func runConfirmToken(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("confirm-token", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	workspace := fs.String("workspace", "", "target workspace_id")
+	action := fs.String("action", "", "privileged action (create|edit|promote|revert|purge)")
+	targetFlag := fs.String("target", "", "optional target memory UUID")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if strings.TrimSpace(*workspace) == "" || strings.TrimSpace(*action) == "" {
+		fmt.Fprintln(stderr, "confirm-token failed: --workspace and --action are required")
+		return 2
+	}
+	reqBody := map[string]any{
+		"workspace_id": strings.TrimSpace(*workspace),
+		"action":       strings.TrimSpace(*action),
+	}
+	if trimmedTarget := strings.TrimSpace(*targetFlag); trimmedTarget != "" {
+		uid, err := uuid.Parse(trimmedTarget)
+		if err != nil {
+			fmt.Fprintf(stderr, "confirm-token failed: invalid --target UUID %q\n", trimmedTarget)
+			return 2
+		}
+		reqBody["target_memory_id"] = uid.String()
+	}
+
+	var res service.ConfirmTokenResult
+	if code := callAdminJSON(ctx, http.MethodPost, "/v1/auth/confirm-token", reqBody, &res, stderr); code != 0 {
+		return code
+	}
+	return writeJSON(stdout, stderr, res)
+}
+
+func runDeadLetters(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("dead-letters", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	limit := fs.Int("limit", 20, "maximum dead-letter records to return")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *limit < 1 {
+		fmt.Fprintln(stderr, "dead-letters failed: --limit must be >= 1")
+		return 2
+	}
+
+	var rep storage.DeadLettersReport
+	if code := callAdminJSON(ctx, http.MethodGet, "/v1/ops/dead-letters?limit="+strconv.Itoa(*limit), nil, &rep, stderr); code != 0 {
+		return code
+	}
+	return writeJSON(stdout, stderr, rep)
+}
+
+func parseRequiredUUIDFlag(raw, cmdName string, stderr io.Writer) (uuid.UUID, bool) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		fmt.Fprintf(stderr, "%s failed: --id=<uuid> is required\n", cmdName)
+		return uuid.Nil, false
+	}
+	id, err := uuid.Parse(trimmed)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s failed: invalid --id UUID %q\n", cmdName, trimmed)
+		return uuid.Nil, false
+	}
+	return id, true
+}
+
+func callAdminJSON(ctx context.Context, method, path string, reqBody, out any, stderr io.Writer) int {
+	adminToken := strings.TrimSpace(os.Getenv("MEM1_ADMIN_TOKEN"))
+	if adminToken == "" {
+		fmt.Fprintln(stderr, "MEM1_ADMIN_TOKEN is required for admin CLI commands")
+		return 1
+	}
+
+	base := adminBaseURL(os.Getenv("MEM1_HTTP_ADDR"))
+	var bodyReader io.Reader
+	if reqBody != nil {
+		raw, err := json.Marshal(reqBody)
+		if err != nil {
+			fmt.Fprintf(stderr, "encode request: %v\n", err)
+			return 1
+		}
+		bodyReader = bytes.NewReader(raw)
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, method, base+path, bodyReader)
+	if err != nil {
+		fmt.Fprintf(stderr, "build request: %v\n", err)
+		return 1
+	}
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	if reqBody != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil {
+		fmt.Fprintf(stderr, "http request failed: %v\n", err)
+		return 1
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+	if err != nil {
+		fmt.Fprintf(stderr, "read response: %v\n", err)
+		return 1
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		fmt.Fprintf(stderr, "HTTP %d: %s\n", resp.StatusCode, strings.TrimSpace(string(respBytes)))
+		return 1
+	}
+	if out != nil && len(respBytes) > 0 {
+		if err := json.Unmarshal(respBytes, out); err != nil {
+			fmt.Fprintf(stderr, "decode JSON response: %v\n", err)
+			return 1
+		}
+	}
+	return 0
+}
+
+func adminBaseURL(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "http://127.0.0.1:8787"
+	}
+	if strings.HasPrefix(trimmed, ":") {
+		return "http://127.0.0.1" + strings.TrimRight(trimmed, "/")
+	}
+	if strings.HasPrefix(trimmed, "http://") || strings.HasPrefix(trimmed, "https://") {
+		return strings.TrimRight(trimmed, "/")
+	}
+	return "http://" + strings.TrimRight(trimmed, "/")
+}
+
 func buildEmbedder(cfg config.Config) (embedding.Embedder, error) {
 	if cfg.EmbedProvider == config.ProviderMock {
 		return embedding.NewMockEmbedder(cfg.EmbedSpaceID), nil
@@ -299,7 +762,15 @@ func writeJSON(stdout, stderr io.Writer, v any) int {
 func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "usage: mem1 <subcommand> [flags]")
 	fmt.Fprintln(w, "subcommands:")
+	fmt.Fprintln(w, "  serve                                          run unified HTTP/MCP server (:8787) and background workers")
+	fmt.Fprintln(w, "  mcp-stdio                                      run lightweight MCP stdio server")
 	fmt.Fprintln(w, "  migrate [--down]                               apply or roll back PostgreSQL schema migrations")
 	fmt.Fprintln(w, "  reindex [--batch-size=32]                      recompute inline memory embeddings in place")
 	fmt.Fprintln(w, "  eval [--suite=...] [--max-tokens=2000]         run Priority 1 quality evaluation harness")
+	fmt.Fprintln(w, "  list [--workspace=<id>] [--limit=100] [--json] list memories across workspaces")
+	fmt.Fprintln(w, "  explain --id=<memory_id>                       inspect memory provenance lineage")
+	fmt.Fprintln(w, "  revert --id=<memory_id> --to-version=<k> --expected-version=<n>")
+	fmt.Fprintln(w, "  purge --id=<memory_id> --yes [--reason=...]    hard-purge memory and cited raw inbox content")
+	fmt.Fprintln(w, "  confirm-token --workspace=<id> --action=<...>  mint single-use confirmation token for MCP")
+	fmt.Fprintln(w, "  dead-letters [--limit=20]                      inspect dead-lettered inbox items and discarded jobs")
 }
