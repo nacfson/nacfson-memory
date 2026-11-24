@@ -73,9 +73,14 @@ type Config struct {
 	EvalJudgeAPIKey   string
 }
 
-// Load reads and validates process environment configuration for the given mode.
+// Load reads and validates process environment configuration for the given mode,
+// automatically loading .env (or MEM1_ENV_FILE) when present with OS env precedence.
 func Load(mode string) (Config, error) {
-	return LoadFromLookup(mode, os.LookupEnv)
+	lookup, err := ResolveEnvLookup("", os.LookupEnv)
+	if err != nil {
+		return Config{}, err
+	}
+	return LoadFromLookup(mode, lookup)
 }
 
 // LoadFromLookup reads and validates configuration from a custom env lookup function.

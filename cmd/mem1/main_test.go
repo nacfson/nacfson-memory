@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -182,5 +184,66 @@ func TestOperatorCLICommandsAgainstHTTPServer(t *testing.T) {
 	errBuf.Reset()
 	if code := run([]string{"dead-letters"}, &out, &errBuf); code != 1 || !strings.Contains(errBuf.String(), "HTTP 401") {
 		t.Fatalf("expected HTTP 401 exit 1, code=%d stderr=%s", code, errBuf.String())
+	}
+}
+
+func TestCLIEnvFileFlagAndMem1EnvFile(t *testing.T) {
+	const adminToken = "envfile-admin-token"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+adminToken {
+			http.Error(w, `{"error":"unauthorized","code":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(storage.DeadLettersReport{
+			DeadLetters:   []storage.DeadLetterInboxItem{},
+			DiscardedJobs: []storage.DiscardedRiverJob{},
+		})
+	}))
+	defer srv.Close()
+
+	envPath := filepath.Join(t.TempDir(), "mem1.env")
+	envContent := "MEM1_HTTP_ADDR=" + srv.URL + "\nMEM1_ADMIN_TOKEN=" + adminToken + "\n"
+	if err := os.WriteFile(envPath, []byte(envContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errBuf bytes.Buffer
+	// --env-file=<path> before subcommand.
+	if code := run([]string{"--env-file=" + envPath, "dead-letters"}, &out, &errBuf); code != 0 {
+		t.Fatalf("--env-file= before subcommand failed: code=%d stderr=%s", code, errBuf.String())
+	}
+
+	// --env-file <path> after subcommand.
+	out.Reset()
+	errBuf.Reset()
+	if code := run([]string{"dead-letters", "--env-file", envPath, "--limit=5"}, &out, &errBuf); code != 0 {
+		t.Fatalf("--env-file after subcommand failed: code=%d stderr=%s", code, errBuf.String())
+	}
+
+	// MEM1_ENV_FILE environment variable.
+	t.Setenv("MEM1_ENV_FILE", envPath)
+	out.Reset()
+	errBuf.Reset()
+	if code := run([]string{"dead-letters"}, &out, &errBuf); code != 0 {
+		t.Fatalf("MEM1_ENV_FILE failed: code=%d stderr=%s", code, errBuf.String())
+	}
+
+	// Missing --env-file value exits 2.
+	for _, args := range [][]string{{"--env-file"}, {"--env-file="}, {"dead-letters", "--env-file"}} {
+		out.Reset()
+		errBuf.Reset()
+		if code := run(args, &out, &errBuf); code != 2 {
+			t.Fatalf("args %v expected exit 2, got %d (stderr=%s)", args, code, errBuf.String())
+		}
+	}
+
+	// Nonexistent --env-file path exits 1.
+	out.Reset()
+	errBuf.Reset()
+	missingPath := filepath.Join(t.TempDir(), "does-not-exist.env")
+	if code := run([]string{"--env-file=" + missingPath, "dead-letters"}, &out, &errBuf); code != 1 {
+		t.Fatalf("missing env file expected exit 1, got %d (stderr=%s)", code, errBuf.String())
 	}
 }

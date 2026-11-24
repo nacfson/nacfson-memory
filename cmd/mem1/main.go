@@ -42,55 +42,103 @@ func main() {
 }
 
 func run(args []string, stdout, stderr io.Writer) int {
-	if len(args) == 0 {
+	envFile, rest, err := extractEnvFileFlag(args)
+	if err != nil {
+		fmt.Fprintf(stderr, "flag error: %v\n", err)
+		return 2
+	}
+	if len(rest) == 0 {
 		printUsage(stderr)
 		return 2
+	}
+
+	switch rest[0] {
+	case "-h", "--help", "help":
+		printUsage(stdout)
+		return 0
+	case "serve", "mcp-stdio", "migrate", "reindex", "eval",
+		"list", "explain", "revert", "purge", "confirm-token", "dead-letters":
+	default:
+		fmt.Fprintf(stderr, "unknown subcommand %q\n", rest[0])
+		printUsage(stderr)
+		return 2
+	}
+
+	envLookup, err := config.ResolveEnvLookup(envFile, os.LookupEnv)
+	if err != nil {
+		fmt.Fprintf(stderr, "env file error: %v\n", err)
+		return 1
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	switch args[0] {
+	switch rest[0] {
 	case "serve":
-		return runServe(ctx, args[1:], stderr)
+		return runServe(ctx, rest[1:], envLookup, stderr)
 	case "mcp-stdio":
-		return runMCPStdio(ctx, args[1:], stderr)
+		return runMCPStdio(ctx, rest[1:], envLookup, stderr)
 	case "migrate":
-		return runMigrate(ctx, args[1:], stdout, stderr)
+		return runMigrate(ctx, rest[1:], envLookup, stdout, stderr)
 	case "reindex":
-		return runReindex(ctx, args[1:], stdout, stderr)
+		return runReindex(ctx, rest[1:], envLookup, stdout, stderr)
 	case "eval":
-		return runEval(ctx, args[1:], stdout, stderr)
+		return runEval(ctx, rest[1:], envLookup, stdout, stderr)
 	case "list":
-		return runList(ctx, args[1:], stdout, stderr)
+		return runList(ctx, rest[1:], envLookup, stdout, stderr)
 	case "explain":
-		return runExplain(ctx, args[1:], stdout, stderr)
+		return runExplain(ctx, rest[1:], envLookup, stdout, stderr)
 	case "revert":
-		return runRevert(ctx, args[1:], stdout, stderr)
+		return runRevert(ctx, rest[1:], envLookup, stdout, stderr)
 	case "purge":
-		return runPurge(ctx, args[1:], stdout, stderr)
+		return runPurge(ctx, rest[1:], envLookup, stdout, stderr)
 	case "confirm-token":
-		return runConfirmToken(ctx, args[1:], stdout, stderr)
+		return runConfirmToken(ctx, rest[1:], envLookup, stdout, stderr)
 	case "dead-letters":
-		return runDeadLetters(ctx, args[1:], stdout, stderr)
-	case "-h", "--help", "help":
-		printUsage(stdout)
-		return 0
+		return runDeadLetters(ctx, rest[1:], envLookup, stdout, stderr)
 	default:
-		fmt.Fprintf(stderr, "unknown subcommand %q\n", args[0])
-		printUsage(stderr)
 		return 2
 	}
 }
 
-func runServe(ctx context.Context, args []string, stderr io.Writer) int {
+func extractEnvFileFlag(args []string) (string, []string, error) {
+	var envFile string
+	rest := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			rest = append(rest, args[i:]...)
+			break
+		}
+		if strings.HasPrefix(arg, "--env-file=") || strings.HasPrefix(arg, "-env-file=") {
+			val := strings.TrimSpace(arg[strings.IndexByte(arg, '=')+1:])
+			if val == "" {
+				return "", nil, errors.New("--env-file requires a non-empty path")
+			}
+			envFile = val
+			continue
+		}
+		if arg == "--env-file" || arg == "-env-file" {
+			if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" {
+				return "", nil, errors.New("--env-file requires a path argument")
+			}
+			envFile = strings.TrimSpace(args[i+1])
+			i++
+			continue
+		}
+		rest = append(rest, arg)
+	}
+	return envFile, rest, nil
+}
+
+func runServe(ctx context.Context, args []string, envLookup func(string) (string, bool), stderr io.Writer) int {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 
-	cfg, err := config.Load(config.ModeServe)
+	cfg, err := config.LoadFromLookup(config.ModeServe, envLookup)
 	if err != nil {
 		fmt.Fprintf(stderr, "config error: %v\n", err)
 		return 1
@@ -193,14 +241,14 @@ func runServe(ctx context.Context, args []string, stderr io.Writer) int {
 	return exitCode
 }
 
-func runMCPStdio(ctx context.Context, args []string, stderr io.Writer) int {
+func runMCPStdio(ctx context.Context, args []string, envLookup func(string) (string, bool), stderr io.Writer) int {
 	fs := flag.NewFlagSet("mcp-stdio", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 
-	cfg, err := config.Load(config.ModeMCPStdio)
+	cfg, err := config.LoadFromLookup(config.ModeMCPStdio, envLookup)
 	if err != nil {
 		fmt.Fprintf(stderr, "config error: %v\n", err)
 		return 1
@@ -239,7 +287,7 @@ func buildRuntimeService(cfg config.Config, store *storage.Store, emb embedding.
 	return svc, lx, dg, curBreaker, embBreaker
 }
 
-func runMigrate(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+func runMigrate(ctx context.Context, args []string, envLookup func(string) (string, bool), stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("migrate", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	down := fs.Bool("down", false, "roll back schema and River migrations")
@@ -247,7 +295,7 @@ func runMigrate(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		return 2
 	}
 
-	cfg, err := config.Load(config.ModeMigrate)
+	cfg, err := config.LoadFromLookup(config.ModeMigrate, envLookup)
 	if err != nil {
 		fmt.Fprintf(stderr, "config error: %v\n", err)
 		return 1
@@ -268,7 +316,7 @@ func runMigrate(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	return 0
 }
 
-func runReindex(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+func runReindex(ctx context.Context, args []string, envLookup func(string) (string, bool), stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("reindex", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	batchSize := fs.Int("batch-size", 32, "memories per embedding batch")
@@ -280,7 +328,7 @@ func runReindex(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		return 2
 	}
 
-	cfg, err := config.Load(config.ModeReindex)
+	cfg, err := config.LoadFromLookup(config.ModeReindex, envLookup)
 	if err != nil {
 		fmt.Fprintf(stderr, "config error: %v\n", err)
 		return 1
@@ -317,7 +365,7 @@ func runReindex(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	return writeJSON(stdout, stderr, res)
 }
 
-func runEval(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+func runEval(ctx context.Context, args []string, envLookup func(string) (string, bool), stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("eval", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	suiteFlag := fs.String("suite", eval.SuiteLongMemEval+","+eval.SuiteMemoryAgentBenchConfl, "comma-separated evaluation suites")
@@ -333,10 +381,10 @@ func runEval(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	lookup := os.LookupEnv
+	lookup := envLookup
 	if *mock {
 		lookup = func(k string) (string, bool) {
-			if v, ok := os.LookupEnv(k); ok && strings.TrimSpace(v) != "" {
+			if v, ok := envLookup(k); ok && strings.TrimSpace(v) != "" {
 				return v, true
 			}
 			switch k {
@@ -433,7 +481,7 @@ func runEval(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func runList(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+func runList(ctx context.Context, args []string, envLookup func(string) (string, bool), stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("list", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	workspace := fs.String("workspace", "", "filter by workspace_id")
@@ -478,7 +526,7 @@ func runList(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	q.Set("limit", strconv.Itoa(*limit))
 
 	var page storage.ListMemoriesPage
-	if code := callAdminJSON(ctx, http.MethodGet, "/v1/memories?"+q.Encode(), nil, &page, stderr); code != 0 {
+	if code := callAdminJSON(ctx, http.MethodGet, "/v1/memories?"+q.Encode(), nil, &page, envLookup, stderr); code != 0 {
 		return code
 	}
 	if *asJSON {
@@ -498,7 +546,7 @@ func runList(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func runExplain(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+func runExplain(ctx context.Context, args []string, envLookup func(string) (string, bool), stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("explain", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	idFlag := fs.String("id", "", "memory UUID to inspect")
@@ -511,13 +559,13 @@ func runExplain(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	}
 
 	var raw json.RawMessage
-	if code := callAdminJSON(ctx, http.MethodGet, "/v1/memories/"+id.String()+"/explain", nil, &raw, stderr); code != 0 {
+	if code := callAdminJSON(ctx, http.MethodGet, "/v1/memories/"+id.String()+"/explain", nil, &raw, envLookup, stderr); code != 0 {
 		return code
 	}
 	return writeJSON(stdout, stderr, raw)
 }
 
-func runRevert(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+func runRevert(ctx context.Context, args []string, envLookup func(string) (string, bool), stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("revert", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	idFlag := fs.String("id", "", "memory UUID to revert")
@@ -541,13 +589,13 @@ func runRevert(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		"expected_version": *expectedVersion,
 		"target_version":   *toVersion,
 		"reason":           *reason,
-	}, &res, stderr); code != 0 {
+	}, &res, envLookup, stderr); code != 0 {
 		return code
 	}
 	return writeJSON(stdout, stderr, res)
 }
 
-func runPurge(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+func runPurge(ctx context.Context, args []string, envLookup func(string) (string, bool), stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("purge", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	idFlag := fs.String("id", "", "memory UUID to purge")
@@ -569,13 +617,13 @@ func runPurge(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	if code := callAdminJSON(ctx, http.MethodPost, "/v1/memories/"+id.String()+"/purge", map[string]any{
 		"confirm": true,
 		"reason":  *reason,
-	}, &res, stderr); code != 0 {
+	}, &res, envLookup, stderr); code != 0 {
 		return code
 	}
 	return writeJSON(stdout, stderr, res)
 }
 
-func runConfirmToken(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+func runConfirmToken(ctx context.Context, args []string, envLookup func(string) (string, bool), stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("confirm-token", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	workspace := fs.String("workspace", "", "target workspace_id")
@@ -602,13 +650,13 @@ func runConfirmToken(ctx context.Context, args []string, stdout, stderr io.Write
 	}
 
 	var res service.ConfirmTokenResult
-	if code := callAdminJSON(ctx, http.MethodPost, "/v1/auth/confirm-token", reqBody, &res, stderr); code != 0 {
+	if code := callAdminJSON(ctx, http.MethodPost, "/v1/auth/confirm-token", reqBody, &res, envLookup, stderr); code != 0 {
 		return code
 	}
 	return writeJSON(stdout, stderr, res)
 }
 
-func runDeadLetters(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+func runDeadLetters(ctx context.Context, args []string, envLookup func(string) (string, bool), stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("dead-letters", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	limit := fs.Int("limit", 20, "maximum dead-letter records to return")
@@ -621,7 +669,7 @@ func runDeadLetters(ctx context.Context, args []string, stdout, stderr io.Writer
 	}
 
 	var rep storage.DeadLettersReport
-	if code := callAdminJSON(ctx, http.MethodGet, "/v1/ops/dead-letters?limit="+strconv.Itoa(*limit), nil, &rep, stderr); code != 0 {
+	if code := callAdminJSON(ctx, http.MethodGet, "/v1/ops/dead-letters?limit="+strconv.Itoa(*limit), nil, &rep, envLookup, stderr); code != 0 {
 		return code
 	}
 	return writeJSON(stdout, stderr, rep)
@@ -641,14 +689,18 @@ func parseRequiredUUIDFlag(raw, cmdName string, stderr io.Writer) (uuid.UUID, bo
 	return id, true
 }
 
-func callAdminJSON(ctx context.Context, method, path string, reqBody, out any, stderr io.Writer) int {
-	adminToken := strings.TrimSpace(os.Getenv("MEM1_ADMIN_TOKEN"))
+func callAdminJSON(ctx context.Context, method, path string, reqBody, out any, envLookup func(string) (string, bool), stderr io.Writer) int {
+	var adminToken string
+	if v, ok := envLookup("MEM1_ADMIN_TOKEN"); ok {
+		adminToken = strings.TrimSpace(v)
+	}
 	if adminToken == "" {
 		fmt.Fprintln(stderr, "MEM1_ADMIN_TOKEN is required for admin CLI commands")
 		return 1
 	}
 
-	base := adminBaseURL(os.Getenv("MEM1_HTTP_ADDR"))
+	httpAddr, _ := envLookup("MEM1_HTTP_ADDR")
+	base := adminBaseURL(httpAddr)
 	var bodyReader io.Reader
 	if reqBody != nil {
 		raw, err := json.Marshal(reqBody)
@@ -760,7 +812,8 @@ func writeJSON(stdout, stderr io.Writer, v any) int {
 }
 
 func printUsage(w io.Writer) {
-	fmt.Fprintln(w, "usage: mem1 <subcommand> [flags]")
+	fmt.Fprintln(w, "usage: mem1 [--env-file=<path>] <subcommand> [flags]")
+	fmt.Fprintln(w, "  loads .env automatically if present (override with --env-file or MEM1_ENV_FILE; shell env takes precedence)")
 	fmt.Fprintln(w, "subcommands:")
 	fmt.Fprintln(w, "  serve                                          run unified HTTP/MCP server (:8787) and background workers")
 	fmt.Fprintln(w, "  mcp-stdio                                      run lightweight MCP stdio server")
