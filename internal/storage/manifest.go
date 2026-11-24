@@ -1292,6 +1292,24 @@ func UpdateMemoryEmbeddingTx(ctx context.Context, db DBTX, memoryID uuid.UUID, e
 	return nil
 }
 
+// UpdateMemoryEmbeddingVersionTx updates an active memory's embedding only when current_version
+// still matches expectedVersion, preventing stale async embed jobs from overwriting newer versions.
+func UpdateMemoryEmbeddingVersionTx(ctx context.Context, db DBTX, memoryID uuid.UUID, expectedVersion int, embedding []float32, spaceID string) (bool, error) {
+	tag, err := db.Exec(ctx, `
+		UPDATE memory_manifest
+		SET embedding = $2,
+		    embedding_space_id = $3,
+		    updated_at = now()
+		WHERE memory_id = $1
+		  AND current_version = $4
+		  AND status = 'active'
+	`, memoryID, nullableHalfVector(embedding), nullableStr(spaceID), expectedVersion)
+	if err != nil {
+		return false, fmt.Errorf("update memory embedding for version %d: %w", expectedVersion, err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 // GetMemory loads one memory_manifest row together with computed premise_drifted status.
 func GetMemory(ctx context.Context, db DBTX, memoryID uuid.UUID) (Memory, error) {
 	m, err := scanMemoryRow(db.QueryRow(ctx, fmt.Sprintf(`

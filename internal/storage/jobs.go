@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -71,16 +70,6 @@ func (CurateWorkspaceJobArgs) InsertOpts() river.InsertOpts {
 	return river.InsertOpts{
 		Queue:       QueueCuration,
 		MaxAttempts: 3,
-		UniqueOpts: river.UniqueOpts{
-			ByArgs:   true,
-			ByPeriod: 5 * time.Second,
-			ByState: []rivertype.JobState{
-				rivertype.JobStateAvailable,
-				rivertype.JobStatePending,
-				rivertype.JobStateRunning,
-				rivertype.JobStateScheduled,
-			},
-		},
 	}
 }
 

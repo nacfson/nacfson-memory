@@ -808,6 +808,12 @@ func TestStorageEdgePathsPaginationAndJobs(t *testing.T) {
 	if err := storage.EnsureWorkspace(ctx, store.CurationPool, "wsedge"); err != nil {
 		t.Fatalf("ensure wsedge: %v", err)
 	}
+	if enq, err := store.EnqueueCurateWorkspace(ctx, "wsedge"); err != nil || !enq {
+		t.Fatalf("expected initial EnqueueCurateWorkspace true, got enq=%v err=%v", enq, err)
+	}
+	if enqDup, err := store.EnqueueCurateWorkspace(ctx, "wsedge"); err != nil || enqDup {
+		t.Fatalf("expected coalesced duplicate EnqueueCurateWorkspace false, got enq=%v err=%v", enqDup, err)
+	}
 	jtx, err := store.CurationPool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("begin jtx: %v", err)
@@ -986,6 +992,14 @@ func TestStorageEdgePathsPaginationAndJobs(t *testing.T) {
 	}
 
 	// Hard purge constitution memory -> verifies constitution_revision increments!
+	// First check UpdateMemoryEmbeddingVersionTx matching vs stale version.
+	if ok, err := storage.UpdateMemoryEmbeddingVersionTx(ctx, etx, memWork.MemoryID, 1, unitVector(2, 1.0), "test:1536"); err != nil || !ok {
+		t.Fatalf("expected matching-version embedding update to succeed, ok=%v err=%v", ok, err)
+	}
+	if ok, err := storage.UpdateMemoryEmbeddingVersionTx(ctx, etx, memWork.MemoryID, 99, unitVector(3, 1.0), "test:1536"); err != nil || ok {
+		t.Fatalf("expected stale-version embedding update to return false, ok=%v err=%v", ok, err)
+	}
+
 	cPurge, err := storage.HardPurgeTx(ctx, etx, memConst.MemoryID, "")
 	if err != nil || cPurge.Revisions.ConstitutionRevision != 1 {
 		t.Fatalf("expected constitution_revision bumped to 1, got %+v err=%v", cPurge, err)

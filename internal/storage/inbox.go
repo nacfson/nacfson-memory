@@ -126,8 +126,8 @@ func (s *Store) InsertInboxAndEnqueueTx(ctx context.Context, params InsertInboxP
 	}
 
 	if !replayed {
-		if _, err := s.RiverInsert.InsertTx(ctx, tx, CurateWorkspaceJobArgs{WorkspaceID: params.WorkspaceID}, nil); err != nil {
-			return InsertInboxResult{}, fmt.Errorf("enqueue curate_workspace job: %w", err)
+		if _, err := s.EnqueueCurateWorkspaceTx(ctx, tx, params.WorkspaceID); err != nil {
+			return InsertInboxResult{}, err
 		}
 	}
 
@@ -313,4 +313,55 @@ func ResetProvisionalToPending(ctx context.Context, tx pgx.Tx, limit int) ([]str
 		return nil, 0, fmt.Errorf("iterate reset provisional rows: %w", err)
 	}
 	return workspaces, count, nil
+}
+
+// EnqueueCurateWorkspaceTx inserts a CurateWorkspaceJob unless one is already queued
+// in ('available', 'pending', 'scheduled') for workspaceID. It intentionally ignores 'running'
+// jobs so concurrent writes or in-worker follow-up enqueues are never dropped.
+func (s *Store) EnqueueCurateWorkspaceTx(ctx context.Context, tx pgx.Tx, workspaceID string) (bool, error) {
+	var queued bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM river_job
+			WHERE kind = 'curate_workspace'
+			  AND queue = 'curation'
+			  AND state IN ('available', 'pending', 'scheduled')
+			  AND args->>'workspace_id' = $1
+		)
+	`, workspaceID).Scan(&queued); err != nil {
+		return false, fmt.Errorf("check queued curate_workspace job: %w", err)
+	}
+	if queued {
+		return false, nil
+	}
+	if _, err := s.RiverInsert.InsertTx(ctx, tx, CurateWorkspaceJobArgs{WorkspaceID: workspaceID}, nil); err != nil {
+		return false, fmt.Errorf("enqueue curate_workspace job: %w", err)
+	}
+	return true, nil
+}
+
+// EnqueueCurateWorkspace inserts a CurateWorkspaceJob outside an explicit transaction
+// unless one is already queued for workspaceID.
+func (s *Store) EnqueueCurateWorkspace(ctx context.Context, workspaceID string) (bool, error) {
+	var queued bool
+	if err := s.CurationPool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM river_job
+			WHERE kind = 'curate_workspace'
+			  AND queue = 'curation'
+			  AND state IN ('available', 'pending', 'scheduled')
+			  AND args->>'workspace_id' = $1
+		)
+	`, workspaceID).Scan(&queued); err != nil {
+		return false, fmt.Errorf("check queued curate_workspace job: %w", err)
+	}
+	if queued {
+		return false, nil
+	}
+	if _, err := s.RiverInsert.Insert(ctx, CurateWorkspaceJobArgs{WorkspaceID: workspaceID}, nil); err != nil {
+		return false, fmt.Errorf("enqueue curate_workspace job: %w", err)
+	}
+	return true, nil
 }
