@@ -490,8 +490,8 @@ func PackRecall(budget int, constitution []storage.Memory, ranked []RankedHit, e
 
 	for _, c := range constitution {
 		rm := toRecalledMemory(c, nil)
-		tok := curation.CountTokens(c.SummaryStub) + curation.CountTokens(c.Body) + 20
-		if constTokensUsed+tok <= constitutionCap {
+		tok := estimateMemoryJSONTokens(c, 0)
+		if len(constMemories) == 0 || constTokensUsed+tok <= constitutionCap {
 			constMemories = append(constMemories, rm)
 			constTokensUsed += tok
 		} else {
@@ -509,7 +509,7 @@ func PackRecall(budget int, constitution []storage.Memory, ranked []RankedHit, e
 
 	for _, r := range ranked {
 		rm := toRecalledMemory(r.Memory, r.Dependencies)
-		tok := curation.CountTokens(r.Memory.SummaryStub) + curation.CountTokens(r.Memory.Body) + 24 + len(r.Dependencies)*24
+		tok := estimateMemoryJSONTokens(r.Memory, len(r.Dependencies))
 		if usedTokens+tok <= directBudget {
 			hitMemories = append(hitMemories, rm)
 			usedTokens += tok
@@ -536,9 +536,11 @@ func PackRecall(budget int, constitution []storage.Memory, ranked []RankedHit, e
 	}
 
 	// Exact serialized JSON eviction loop across 4 deterministic tiers.
-	for countSerializedTokens(resp) > budget {
+	curTokens := countSerializedTokens(resp)
+	for curTokens > budget {
 		// Tier 1: Drop lowest-ranked non-drifted dependency details first.
 		if dropLowestNonDriftedDep(&resp, constCount) {
+			curTokens = countSerializedTokens(resp)
 			continue
 		}
 		// Tier 2: Downgrade lowest-ranked non-constitution hit from full body to stub.
@@ -547,11 +549,13 @@ func PackRecall(budget int, constitution []storage.Memory, ranked []RankedHit, e
 			resp.Memories = resp.Memories[:len(resp.Memories)-1]
 			// Insert newly downgraded higher-ranked hit stub before lower-ranked hit stubs.
 			resp.Stubs = append([]MemoryStub{toMemoryStub(last)}, resp.Stubs...)
+			curTokens = countSerializedTokens(resp)
 			continue
 		}
 		// Tier 3: Drop lowest-ranked overflow stub.
 		if len(resp.Stubs) > 0 {
 			resp.Stubs = resp.Stubs[:len(resp.Stubs)-1]
+			curTokens = countSerializedTokens(resp)
 			continue
 		}
 		// Tier 4: Convert excess constitution entry to stub (when budget permits stubs to fit).
@@ -566,18 +570,29 @@ func PackRecall(budget int, constitution []storage.Memory, ranked []RankedHit, e
 			if countSerializedTokens(withStub) <= budget || len(resp.Memories) > 0 {
 				resp.Stubs = append([]MemoryStub{candidateStub}, resp.Stubs...)
 			}
+			curTokens = countSerializedTokens(resp)
 			continue
 		}
 		// Ultra-small budget safety: cannot shrink items further; clear etag if non-empty.
 		if resp.ManifestETag != "" {
 			resp.ManifestETag = ""
+			curTokens = countSerializedTokens(resp)
 			continue
 		}
 		break
 	}
 
-	resp.SerializedTokens = countSerializedTokens(resp)
+	resp.SerializedTokens = curTokens
 	return resp
+}
+
+func estimateMemoryJSONTokens(m storage.Memory, depCount int) int {
+	bodyToks := m.TokenCount
+	if bodyToks <= 0 {
+		bodyToks = curation.CountTokens(m.Body)
+	}
+	stubToks := curation.CountTokens(m.SummaryStub)
+	return bodyToks + stubToks + 52 + depCount*48
 }
 
 func dropLowestNonDriftedDep(resp *RecallResponse, constCount int) bool {
@@ -612,14 +627,17 @@ func PackExpand(budget int, ordered []RankedHit, etag string, wsRev int64) Expan
 		WorkspaceRevision: wsRev,
 	}
 
-	for countSerializedTokens(resp) > budget {
+	curTokens := countSerializedTokens(resp)
+	for curTokens > budget {
 		if dropExpandEdge(&resp) {
 			resp.Truncated = true
+			curTokens = countSerializedTokens(resp)
 			continue
 		}
 		if len(resp.Memories) > 1 {
 			resp.Memories = resp.Memories[:len(resp.Memories)-1]
 			resp.Truncated = true
+			curTokens = countSerializedTokens(resp)
 			continue
 		}
 		if len(resp.Memories) == 1 && len(resp.Memories[0].Body) > 0 {
@@ -631,12 +649,13 @@ func PackExpand(budget int, ordered []RankedHit, etag string, wsRev int64) Expan
 				resp.Memories[0].Body = trimmed
 			}
 			resp.Truncated = true
+			curTokens = countSerializedTokens(resp)
 			continue
 		}
 		break
 	}
 
-	resp.SerializedTokens = countSerializedTokens(resp)
+	resp.SerializedTokens = curTokens
 	return resp
 }
 

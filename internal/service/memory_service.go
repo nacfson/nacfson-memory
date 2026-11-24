@@ -73,51 +73,60 @@ type MemoryDetailResult struct {
 
 // ManualCreateRequest carries a user_explicit memory creation.
 type ManualCreateRequest struct {
-	WorkspaceID string           `json:"workspace_id"`
-	Durability  string           `json:"durability"`
-	Category    string           `json:"category,omitempty"`
-	TopicKey    string           `json:"topic_key"`
-	SummaryStub string           `json:"summary_stub,omitempty"`
-	Body        string           `json:"body"`
-	DependsOn   []graph.EdgeSpec `json:"depends_on,omitempty"`
-	AgentID     string           `json:"agent_id,omitempty"`
-	Reason      string           `json:"reason,omitempty"`
+	WorkspaceID  string                      `json:"workspace_id"`
+	Durability   string                      `json:"durability"`
+	Category     string                      `json:"category,omitempty"`
+	TopicKey     string                      `json:"topic_key"`
+	SummaryStub  string                      `json:"summary_stub,omitempty"`
+	Body         string                      `json:"body"`
+	DependsOn    []graph.EdgeSpec            `json:"depends_on,omitempty"`
+	AgentID      string                      `json:"agent_id,omitempty"`
+	Reason       string                      `json:"reason,omitempty"`
+	ConfirmToken *ConsumeConfirmTokenRequest `json:"-"`
 }
 
 // ManualEditRequest configures a CAS-guarded manual partial update.
 type ManualEditRequest struct {
-	MemoryID        uuid.UUID        `json:"memory_id"`
-	ExpectedVersion int              `json:"expected_version"`
-	Durability      *string          `json:"durability,omitempty"`
-	Category        string           `json:"category,omitempty"`
-	SummaryStub     *string          `json:"summary_stub,omitempty"`
-	Body            *string          `json:"body,omitempty"`
-	DependsOn       []graph.EdgeSpec `json:"depends_on,omitempty"`
-	AgentID         string           `json:"agent_id,omitempty"`
-	Reason          string           `json:"reason,omitempty"`
+	WorkspaceID              string                      `json:"workspace_id,omitempty"`
+	MemoryID                 uuid.UUID                   `json:"memory_id"`
+	ExpectedVersion          int                         `json:"expected_version"`
+	RequireCurrentDurability string                      `json:"-"`
+	Durability               *string                     `json:"durability,omitempty"`
+	Category                 string                      `json:"category,omitempty"`
+	SummaryStub              *string                     `json:"summary_stub,omitempty"`
+	Body                     *string                     `json:"body,omitempty"`
+	DependsOn                []graph.EdgeSpec            `json:"depends_on,omitempty"`
+	AgentID                  string                      `json:"agent_id,omitempty"`
+	Reason                   string                      `json:"reason,omitempty"`
+	ConfirmToken             *ConsumeConfirmTokenRequest `json:"-"`
 }
 
 // RevertMemoryRequest configures a monotonic cherry-pick rollback to TargetVersion.
 type RevertMemoryRequest struct {
-	MemoryID        uuid.UUID `json:"memory_id"`
-	ExpectedVersion int       `json:"expected_version"`
-	TargetVersion   int       `json:"target_version"`
-	Reason          string    `json:"reason,omitempty"`
+	WorkspaceID     string                      `json:"workspace_id,omitempty"`
+	MemoryID        uuid.UUID                   `json:"memory_id"`
+	ExpectedVersion int                         `json:"expected_version"`
+	TargetVersion   int                         `json:"target_version"`
+	Reason          string                      `json:"reason,omitempty"`
+	ConfirmToken    *ConsumeConfirmTokenRequest `json:"-"`
 }
 
 // SoftRetireRequest explicitly retires an active memory and its outgoing edges.
 type SoftRetireRequest struct {
-	MemoryID        uuid.UUID `json:"memory_id"`
-	WorkspaceID     string    `json:"workspace_id,omitempty"`
-	ExpectedVersion int       `json:"expected_version,omitempty"`
-	Reason          string    `json:"reason,omitempty"`
+	MemoryID           uuid.UUID `json:"memory_id"`
+	WorkspaceID        string    `json:"workspace_id,omitempty"`
+	ExpectedVersion    int       `json:"expected_version,omitempty"`
+	ForbidConstitution bool      `json:"-"`
+	Reason             string    `json:"reason,omitempty"`
 }
 
 // HardPurgeRequest explicitly deletes a memory and redacts/removes exclusively cited sources.
 type HardPurgeRequest struct {
-	MemoryID uuid.UUID `json:"memory_id"`
-	Confirm  bool      `json:"confirm"`
-	Reason   string    `json:"reason,omitempty"`
+	WorkspaceID  string                      `json:"workspace_id,omitempty"`
+	MemoryID     uuid.UUID                   `json:"memory_id"`
+	Confirm      bool                        `json:"confirm"`
+	Reason       string                      `json:"reason,omitempty"`
+	ConfirmToken *ConsumeConfirmTokenRequest `json:"-"`
 }
 
 // ManualMutationResult summarizes a committed manifest transition.
@@ -188,11 +197,11 @@ type backend interface {
 	GetRevisions(ctx context.Context, memoryID uuid.UUID) ([]storage.MemoryRevision, error)
 	ExplainLineage(ctx context.Context, memoryID uuid.UUID) (storage.MemoryLineage, error)
 	GetWorkspace(ctx context.Context, workspaceID string) (storage.Workspace, error)
-	ManualCreateTx(ctx context.Context, params storage.CreateMemoryParams, dependsOn []graph.EdgeSpec, needsEmbedJob bool) (storage.Memory, storage.WorkspaceRevisions, int64, error)
-	ManualEditTx(ctx context.Context, oldDur string, params storage.EditMemoryParams, dependsOn []graph.EdgeSpec, retentionN int, needsEmbedJob bool) (storage.Memory, storage.WorkspaceRevisions, int64, error)
-	ManualRevertTx(ctx context.Context, oldDur string, params storage.RevertMemoryParams, retentionN int, needsEmbedJob bool) (storage.Memory, storage.WorkspaceRevisions, int64, error)
+	ManualCreateTx(ctx context.Context, params storage.CreateMemoryParams, dependsOn []graph.EdgeSpec, needsEmbedJob bool, confirmTok *ConsumeConfirmTokenRequest) (storage.Memory, storage.WorkspaceRevisions, int64, error)
+	ManualEditTx(ctx context.Context, oldDur string, params storage.EditMemoryParams, dependsOn []graph.EdgeSpec, retentionN int, needsEmbedJob bool, confirmTok *ConsumeConfirmTokenRequest) (storage.Memory, storage.WorkspaceRevisions, int64, error)
+	ManualRevertTx(ctx context.Context, oldDur string, params storage.RevertMemoryParams, retentionN int, needsEmbedJob bool, confirmTok *ConsumeConfirmTokenRequest) (storage.Memory, storage.WorkspaceRevisions, int64, error)
 	SoftRetireTx(ctx context.Context, params storage.SoftRetireParams, reason string) (storage.Memory, storage.WorkspaceRevisions, int64, error)
-	HardPurgeTx(ctx context.Context, memoryID uuid.UUID, reason string) (storage.HardPurgeResult, error)
+	HardPurgeTx(ctx context.Context, memoryID uuid.UUID, workspaceID, reason string, confirmTok *ConsumeConfirmTokenRequest) (storage.HardPurgeResult, error)
 	OpsSnapshot(ctx context.Context) (storage.AllPoolStats, storage.InboxStatusCounts, []storage.RiverQueueStat, error)
 	ListCurationDecisions(ctx context.Context, params storage.ListDecisionsParams) (storage.ListDecisionsPage, error)
 	ListDeadLetters(ctx context.Context, limit int) (storage.DeadLettersReport, error)
@@ -446,7 +455,7 @@ func (s *MemoryService) ManualCreate(ctx context.Context, req ManualCreateReques
 		AgentID:          req.AgentID,
 		SourceAuthority:  "user_explicit",
 		ChangeReason:     reason,
-	}, req.DependsOn, needsEmbedJob)
+	}, req.DependsOn, needsEmbedJob, req.ConfirmToken)
 	if err != nil {
 		return ManualMutationResult{}, err
 	}
@@ -467,6 +476,12 @@ func (s *MemoryService) ManualEdit(ctx context.Context, req ManualEditRequest) (
 		return ManualMutationResult{}, err
 	}
 	cur := detail.Memory
+	if req.WorkspaceID != "" && cur.WorkspaceID != req.WorkspaceID {
+		return ManualMutationResult{}, fmt.Errorf("memory %s not in workspace %q: %w", req.MemoryID, req.WorkspaceID, storage.ErrNotFound)
+	}
+	if req.RequireCurrentDurability != "" && cur.Durability != req.RequireCurrentDurability {
+		return ManualMutationResult{}, fmt.Errorf("invalid_action: expected durability %q, found %q: %w", req.RequireCurrentDurability, cur.Durability, storage.ErrInvalidInput)
+	}
 	ws, err := s.be.GetWorkspace(ctx, cur.WorkspaceID)
 	if err != nil {
 		return ManualMutationResult{}, err
@@ -540,20 +555,21 @@ func (s *MemoryService) ManualEdit(ctx context.Context, req ManualEditRequest) (
 		durPtr = &newDur
 	}
 	mem, revs, genRev, err := s.be.ManualEditTx(ctx, cur.Durability, storage.EditMemoryParams{
-		MemoryID:         req.MemoryID,
-		WorkspaceID:      cur.WorkspaceID,
-		ExpectedVersion:  req.ExpectedVersion,
-		Durability:       durPtr,
-		SummaryStub:      scrubbedStubPtr,
-		Body:             scrubbedBodyPtr,
-		TokenCount:       &tokCount,
-		CurationState:    storage.CurationUserExplicit,
-		Embedding:        vec,
-		EmbeddingSpaceID: spaceID,
-		AgentID:          req.AgentID,
-		SourceAuthority:  "user_explicit",
-		ChangeReason:     reason,
-	}, req.DependsOn, s.cfg.HistoryRetentionN, needsEmbedJob)
+		MemoryID:                 req.MemoryID,
+		WorkspaceID:              cur.WorkspaceID,
+		ExpectedVersion:          req.ExpectedVersion,
+		RequireCurrentDurability: req.RequireCurrentDurability,
+		Durability:               durPtr,
+		SummaryStub:              scrubbedStubPtr,
+		Body:                     scrubbedBodyPtr,
+		TokenCount:               &tokCount,
+		CurationState:            storage.CurationUserExplicit,
+		Embedding:                vec,
+		EmbeddingSpaceID:         spaceID,
+		AgentID:                  req.AgentID,
+		SourceAuthority:          "user_explicit",
+		ChangeReason:             reason,
+	}, req.DependsOn, s.cfg.HistoryRetentionN, needsEmbedJob, req.ConfirmToken)
 	if err != nil {
 		return ManualMutationResult{}, err
 	}
@@ -569,6 +585,9 @@ func (s *MemoryService) RevertMemory(ctx context.Context, req RevertMemoryReques
 	detail, err := s.be.GetMemoryDetail(ctx, req.MemoryID)
 	if err != nil {
 		return ManualMutationResult{}, err
+	}
+	if req.WorkspaceID != "" && detail.Memory.WorkspaceID != req.WorkspaceID {
+		return ManualMutationResult{}, fmt.Errorf("memory %s not in workspace %q: %w", req.MemoryID, req.WorkspaceID, storage.ErrNotFound)
 	}
 	ws, err := s.be.GetWorkspace(ctx, detail.Memory.WorkspaceID)
 	if err != nil {
@@ -613,7 +632,7 @@ func (s *MemoryService) RevertMemory(ctx context.Context, req RevertMemoryReques
 		Embedding:        vec,
 		EmbeddingSpaceID: spaceID,
 		Reason:           strings.TrimSpace(req.Reason),
-	}, s.cfg.HistoryRetentionN, needsEmbedJob)
+	}, s.cfg.HistoryRetentionN, needsEmbedJob, req.ConfirmToken)
 	if err != nil {
 		return ManualMutationResult{}, err
 	}
@@ -640,9 +659,10 @@ func (s *MemoryService) SoftRetire(ctx context.Context, req SoftRetireRequest) (
 	}
 
 	mem, revs, genRev, err := s.be.SoftRetireTx(ctx, storage.SoftRetireParams{
-		MemoryID:        req.MemoryID,
-		WorkspaceID:     wsID,
-		ExpectedVersion: req.ExpectedVersion,
+		MemoryID:           req.MemoryID,
+		WorkspaceID:        wsID,
+		ExpectedVersion:    req.ExpectedVersion,
+		ForbidConstitution: req.ForbidConstitution,
 	}, strings.TrimSpace(req.Reason))
 	if err != nil {
 		return ManualMutationResult{}, err
@@ -657,7 +677,7 @@ func (s *MemoryService) HardPurge(ctx context.Context, req HardPurgeRequest) (st
 	if !req.Confirm {
 		return storage.HardPurgeResult{}, fmt.Errorf("confirm=true is required for hard_purge: %w", storage.ErrInvalidInput)
 	}
-	return s.be.HardPurgeTx(ctx, req.MemoryID, strings.TrimSpace(req.Reason))
+	return s.be.HardPurgeTx(ctx, req.MemoryID, req.WorkspaceID, strings.TrimSpace(req.Reason), req.ConfirmToken)
 }
 
 func (s *MemoryService) OpsStatus(ctx context.Context) (OpsStatusResult, error) {
@@ -930,7 +950,14 @@ func (p *pgBackend) GetWorkspace(ctx context.Context, workspaceID string) (stora
 	return storage.GetWorkspace(ctx, p.store.CurationPool, workspaceID)
 }
 
-func (p *pgBackend) ManualCreateTx(ctx context.Context, params storage.CreateMemoryParams, dependsOn []graph.EdgeSpec, needsEmbedJob bool) (storage.Memory, storage.WorkspaceRevisions, int64, error) {
+func consumeConfirmTokenTx(ctx context.Context, tx pgx.Tx, tok *ConsumeConfirmTokenRequest) error {
+	if tok == nil {
+		return nil
+	}
+	return storage.ConsumeConfirmToken(ctx, tx, tok.Token, tok.WorkspaceID, tok.Action, tok.TargetMemoryID)
+}
+
+func (p *pgBackend) ManualCreateTx(ctx context.Context, params storage.CreateMemoryParams, dependsOn []graph.EdgeSpec, needsEmbedJob bool, confirmTok *ConsumeConfirmTokenRequest) (storage.Memory, storage.WorkspaceRevisions, int64, error) {
 	tx, err := p.store.CurationPool.Begin(ctx)
 	if err != nil {
 		return storage.Memory{}, storage.WorkspaceRevisions{}, 0, fmt.Errorf("begin manual create tx: %w", err)
@@ -938,6 +965,9 @@ func (p *pgBackend) ManualCreateTx(ctx context.Context, params storage.CreateMem
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	if _, err := storage.LockWorkspaceTx(ctx, tx, params.WorkspaceID); err != nil {
+		return storage.Memory{}, storage.WorkspaceRevisions{}, 0, err
+	}
+	if err := consumeConfirmTokenTx(ctx, tx, confirmTok); err != nil {
 		return storage.Memory{}, storage.WorkspaceRevisions{}, 0, err
 	}
 	mem, err := storage.CreateMemoryTx(ctx, tx, params)
@@ -977,7 +1007,7 @@ func (p *pgBackend) ManualCreateTx(ctx context.Context, params storage.CreateMem
 	return mem, revs, genRev, nil
 }
 
-func (p *pgBackend) ManualEditTx(ctx context.Context, oldDur string, params storage.EditMemoryParams, dependsOn []graph.EdgeSpec, retentionN int, needsEmbedJob bool) (storage.Memory, storage.WorkspaceRevisions, int64, error) {
+func (p *pgBackend) ManualEditTx(ctx context.Context, oldDur string, params storage.EditMemoryParams, dependsOn []graph.EdgeSpec, retentionN int, needsEmbedJob bool, confirmTok *ConsumeConfirmTokenRequest) (storage.Memory, storage.WorkspaceRevisions, int64, error) {
 	tx, err := p.store.CurationPool.Begin(ctx)
 	if err != nil {
 		return storage.Memory{}, storage.WorkspaceRevisions{}, 0, fmt.Errorf("begin manual edit tx: %w", err)
@@ -985,6 +1015,9 @@ func (p *pgBackend) ManualEditTx(ctx context.Context, oldDur string, params stor
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	if _, err := storage.LockWorkspaceTx(ctx, tx, params.WorkspaceID); err != nil {
+		return storage.Memory{}, storage.WorkspaceRevisions{}, 0, err
+	}
+	if err := consumeConfirmTokenTx(ctx, tx, confirmTok); err != nil {
 		return storage.Memory{}, storage.WorkspaceRevisions{}, 0, err
 	}
 	mem, err := storage.EditMemoryTx(ctx, tx, params)
@@ -1030,7 +1063,7 @@ func (p *pgBackend) ManualEditTx(ctx context.Context, oldDur string, params stor
 	return mem, revs, genRev, nil
 }
 
-func (p *pgBackend) ManualRevertTx(ctx context.Context, oldDur string, params storage.RevertMemoryParams, retentionN int, needsEmbedJob bool) (storage.Memory, storage.WorkspaceRevisions, int64, error) {
+func (p *pgBackend) ManualRevertTx(ctx context.Context, oldDur string, params storage.RevertMemoryParams, retentionN int, needsEmbedJob bool, confirmTok *ConsumeConfirmTokenRequest) (storage.Memory, storage.WorkspaceRevisions, int64, error) {
 	tx, err := p.store.CurationPool.Begin(ctx)
 	if err != nil {
 		return storage.Memory{}, storage.WorkspaceRevisions{}, 0, fmt.Errorf("begin manual revert tx: %w", err)
@@ -1038,6 +1071,9 @@ func (p *pgBackend) ManualRevertTx(ctx context.Context, oldDur string, params st
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	if _, err := storage.LockWorkspaceTx(ctx, tx, params.WorkspaceID); err != nil {
+		return storage.Memory{}, storage.WorkspaceRevisions{}, 0, err
+	}
+	if err := consumeConfirmTokenTx(ctx, tx, confirmTok); err != nil {
 		return storage.Memory{}, storage.WorkspaceRevisions{}, 0, err
 	}
 	mem, err := storage.RevertToVersionTx(ctx, tx, params)
@@ -1122,7 +1158,7 @@ func (p *pgBackend) SoftRetireTx(ctx context.Context, params storage.SoftRetireP
 	return mem, revs, genRev, nil
 }
 
-func (p *pgBackend) HardPurgeTx(ctx context.Context, memoryID uuid.UUID, reason string) (storage.HardPurgeResult, error) {
+func (p *pgBackend) HardPurgeTx(ctx context.Context, memoryID uuid.UUID, workspaceID, reason string, confirmTok *ConsumeConfirmTokenRequest) (storage.HardPurgeResult, error) {
 	tx, err := p.store.CurationPool.Begin(ctx)
 	if err != nil {
 		return storage.HardPurgeResult{}, fmt.Errorf("begin hard purge tx: %w", err)
@@ -1131,6 +1167,12 @@ func (p *pgBackend) HardPurgeTx(ctx context.Context, memoryID uuid.UUID, reason 
 
 	res, err := storage.HardPurgeTx(ctx, tx, memoryID, reason)
 	if err != nil {
+		return storage.HardPurgeResult{}, err
+	}
+	if workspaceID != "" && res.WorkspaceID != workspaceID {
+		return storage.HardPurgeResult{}, fmt.Errorf("memory %s does not belong to workspace %q: %w", memoryID, workspaceID, storage.ErrNotFound)
+	}
+	if err := consumeConfirmTokenTx(ctx, tx, confirmTok); err != nil {
 		return storage.HardPurgeResult{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {

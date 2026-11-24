@@ -411,3 +411,57 @@ func TestMCPStaticCapabilitiesAvoidIdleSSEAndSupportFlush(t *testing.T) {
 	}
 	sseCancel()
 }
+
+type chunkedReader struct{ r io.Reader }
+
+func (c chunkedReader) Read(p []byte) (int, error) { return c.r.Read(p) }
+
+func TestMiddlewareAndDecoderEdgeCases(t *testing.T) {
+	svc := &fakeService{health: service.HealthCheckResult{Status: "ok", DBOk: true}}
+	mcpHandler := mcpserver.NewStreamableHTTPHandler(svc, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h := NewHandler(testConfig(), svc, mcpHandler, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	// 1. Non-HTTP(S) scheme or userinfo in Origin rejected with 403.
+	for _, badOrigin := range []string{"file://localhost/index.html", "http://user@127.0.0.1:8787"} {
+		req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8787/healthz", nil)
+		req.Header.Set("Origin", badOrigin)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 for Origin=%q, got %d", badOrigin, rec.Code)
+		}
+	}
+
+	// 2. Trailing JSON garbage rejected with 400.
+	trailReq := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/v1/workspaces", strings.NewReader(`{"workspace_id":"app"}{"extra":1}`))
+	trailReq.Header.Set("Authorization", "Bearer admin-tok")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, trailReq)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on trailing JSON data, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// 3. Unknown Content-Length (> 64 KiB) chunked body on /v1/* still enforced via MaxBytesReader -> 413.
+	bigJSON := `{"workspace_id":"app","extra":"` + strings.Repeat("a", 65*1024) + `"}`
+	chunkReq := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/v1/workspaces", chunkedReader{r: strings.NewReader(bigJSON)})
+	chunkReq.ContentLength = -1
+	chunkReq.Header.Set("Authorization", "Bearer admin-tok")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, chunkReq)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413 on chunked >64KiB body, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// 4. isMCPPath strict boundary check and bufferedMCPWriter first-WriteHeader preservation.
+	if !isMCPPath("/mcp") || !isMCPPath("/mcp/sub") || isMCPPath("/mcp-other") {
+		t.Fatalf("unexpected isMCPPath routing behavior")
+	}
+	dst := httptest.NewRecorder()
+	bw := newBufferedMCPWriter(dst, &atomic.Bool{})
+	bw.WriteHeader(http.StatusAccepted)
+	bw.WriteHeader(http.StatusTeapot)
+	bw.finish()
+	if dst.Code != http.StatusAccepted {
+		t.Fatalf("expected first WriteHeader status %d preserved, got %d", http.StatusAccepted, dst.Code)
+	}
+}

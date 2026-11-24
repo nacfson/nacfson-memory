@@ -166,3 +166,31 @@ func TestPackExpandTruncatesUnderTightBudget(t *testing.T) {
 		t.Fatalf("expected truncated expand <= 200 tokens, got truncated=%v toks=%d", tight.Truncated, tight.SerializedTokens)
 	}
 }
+
+func TestPackRecallTightBudgetPacksFirstConstitutionRule(t *testing.T) {
+	constMems := []storage.Memory{
+		{
+			MemoryID: uuid.New(), WorkspaceID: "app", Durability: storage.DurabilityConstitution,
+			TopicKey: "concise", CurationState: storage.CurationUserExplicit, CurrentVersion: 1,
+			SummaryStub: "Keep responses brief", Body: "Be brief.",
+		},
+	}
+	ranked := []RankedHit{
+		{
+			Memory: storage.Memory{
+				MemoryID: uuid.New(), WorkspaceID: "app", Durability: storage.DurabilityDurable,
+				TopicKey: "db", CurationState: storage.CurationCuratorVerified, CurrentVersion: 1,
+				SummaryStub: "PG 17", Body: "Use PostgreSQL 17.",
+			},
+			Score: 10,
+		},
+	}
+
+	resp := PackRecall(120, constMems, ranked, `W/"ws:1"`, 1, false)
+	if resp.SerializedTokens > 120 {
+		t.Fatalf("expected serialized tokens <= 120, got %d", resp.SerializedTokens)
+	}
+	if len(resp.Memories) == 0 || resp.Memories[0].TopicKey != "concise" {
+		t.Fatalf("expected concise constitution rule packed in full under 120-token budget, got mems=%+v stubs=%+v", resp.Memories, resp.Stubs)
+	}
+}

@@ -73,7 +73,7 @@ func (f *fakeBackend) ExplainLineage(_ context.Context, id uuid.UUID) (storage.M
 func (f *fakeBackend) GetWorkspace(context.Context, string) (storage.Workspace, error) {
 	return f.ws, nil
 }
-func (f *fakeBackend) ManualCreateTx(_ context.Context, params storage.CreateMemoryParams, _ []graph.EdgeSpec, needsEmbedJob bool) (storage.Memory, storage.WorkspaceRevisions, int64, error) {
+func (f *fakeBackend) ManualCreateTx(_ context.Context, params storage.CreateMemoryParams, _ []graph.EdgeSpec, needsEmbedJob bool, _ *ConsumeConfirmTokenRequest) (storage.Memory, storage.WorkspaceRevisions, int64, error) {
 	f.createNeedJob = needsEmbedJob
 	return storage.Memory{
 		MemoryID: uuid.New(), WorkspaceID: params.WorkspaceID, Durability: params.Durability,
@@ -81,14 +81,14 @@ func (f *fakeBackend) ManualCreateTx(_ context.Context, params storage.CreateMem
 		SummaryStub: params.SummaryStub, Body: params.Body,
 	}, storage.WorkspaceRevisions{ManifestRevision: 2}, 1, nil
 }
-func (f *fakeBackend) ManualEditTx(_ context.Context, _ string, params storage.EditMemoryParams, _ []graph.EdgeSpec, _ int, needsEmbedJob bool) (storage.Memory, storage.WorkspaceRevisions, int64, error) {
+func (f *fakeBackend) ManualEditTx(_ context.Context, _ string, params storage.EditMemoryParams, _ []graph.EdgeSpec, _ int, needsEmbedJob bool, _ *ConsumeConfirmTokenRequest) (storage.Memory, storage.WorkspaceRevisions, int64, error) {
 	f.editNeedJob = needsEmbedJob
 	return storage.Memory{
 		MemoryID: params.MemoryID, WorkspaceID: params.WorkspaceID, Durability: storage.DurabilityDurable,
 		Status: storage.StatusActive, CurrentVersion: params.ExpectedVersion + 1,
 	}, storage.WorkspaceRevisions{ManifestRevision: 3}, 1, nil
 }
-func (f *fakeBackend) ManualRevertTx(_ context.Context, _ string, params storage.RevertMemoryParams, _ int, needsEmbedJob bool) (storage.Memory, storage.WorkspaceRevisions, int64, error) {
+func (f *fakeBackend) ManualRevertTx(_ context.Context, _ string, params storage.RevertMemoryParams, _ int, needsEmbedJob bool, _ *ConsumeConfirmTokenRequest) (storage.Memory, storage.WorkspaceRevisions, int64, error) {
 	f.revertNeedJob = needsEmbedJob
 	return storage.Memory{
 		MemoryID: params.MemoryID, WorkspaceID: params.WorkspaceID, Durability: storage.DurabilityDurable,
@@ -100,7 +100,7 @@ func (f *fakeBackend) SoftRetireTx(_ context.Context, params storage.SoftRetireP
 		MemoryID: params.MemoryID, WorkspaceID: params.WorkspaceID, Status: storage.StatusRetired, CurrentVersion: 1,
 	}, storage.WorkspaceRevisions{ManifestRevision: 5}, 0, nil
 }
-func (f *fakeBackend) HardPurgeTx(context.Context, uuid.UUID, string) (storage.HardPurgeResult, error) {
+func (f *fakeBackend) HardPurgeTx(context.Context, uuid.UUID, string, string, *ConsumeConfirmTokenRequest) (storage.HardPurgeResult, error) {
 	return f.purgeRes, nil
 }
 func (f *fakeBackend) OpsSnapshot(context.Context) (storage.AllPoolStats, storage.InboxStatusCounts, []storage.RiverQueueStat, error) {

@@ -1,17 +1,19 @@
 package curation
 
 import (
+	"container/heap"
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
-	"github.com/pkoukk/tiktoken-go"
 	tiktoken_loader "github.com/pkoukk/tiktoken-go-loader"
 
 	"github.com/nacfson/nacfson-memory/internal/graph"
@@ -33,6 +35,9 @@ const (
 	MaxSummaryStubRunes   = 180
 	MaxBodyTokens         = 1500
 	MaxConstitutionTokens = 500
+
+	cl100kBPEURL     = "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken"
+	maxSmallBPEPiece = 256
 )
 
 var (
@@ -43,29 +48,389 @@ var (
 
 	topicKeyRegex = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,127}$`)
 
-	cl100kOnce sync.Once
-	cl100kEnc  *tiktoken.Tiktoken
-	cl100kErr  error
+	cl100kRanksOnce sync.Once
+	cl100kRanks     map[string]int
+	cl100kRanksErr  error
 )
 
-func getEncoding() (*tiktoken.Tiktoken, error) {
-	cl100kOnce.Do(func() {
-		tiktoken.SetBpeLoader(tiktoken_loader.NewOfflineLoader())
-		cl100kEnc, cl100kErr = tiktoken.GetEncoding("cl100k_base")
+func loadCL100KRanks() (map[string]int, error) {
+	cl100kRanksOnce.Do(func() {
+		cl100kRanks, cl100kRanksErr = tiktoken_loader.NewOfflineLoader().LoadTiktokenBpe(cl100kBPEURL)
 	})
-	return cl100kEnc, cl100kErr
+	return cl100kRanks, cl100kRanksErr
 }
 
-// CountTokens returns the cl100k_base ordinary token count for text offline.
+// CountTokens returns the cl100k_base ordinary token count for text offline
+// using a zero-allocation pure-Go cl100k pretokenizer and stack-buffered BPE merge.
 func CountTokens(text string) int {
 	if text == "" {
 		return 0
 	}
-	enc, err := getEncoding()
-	if err != nil {
+	ranks, err := loadCL100KRanks()
+	if err != nil || len(ranks) == 0 {
 		return (len(text) + 3) / 4
 	}
-	return len(enc.EncodeOrdinary(text))
+
+	total := 0
+	for pos := 0; pos < len(text); {
+		end := nextCL100KPiece(text, pos)
+		piece := text[pos:end]
+		if _, ok := ranks[piece]; ok {
+			total++
+		} else {
+			total += bytePairMergeCount(piece, ranks)
+		}
+		pos = end
+	}
+	return total
+}
+
+func asciiLower(b byte) byte {
+	if b >= 'A' && b <= 'Z' {
+		return b + ('a' - 'A')
+	}
+	return b
+}
+
+func decodeAt(s string, i int) (rune, int) {
+	if i >= len(s) {
+		return 0, 0
+	}
+	if b := s[i]; b < utf8.RuneSelf {
+		return rune(b), 1
+	}
+	return utf8.DecodeRuneInString(s[i:])
+}
+
+func isCL100KLetter(r rune) bool {
+	if r < utf8.RuneSelf {
+		return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
+	}
+	return unicode.IsLetter(r)
+}
+
+func isCL100KNumber(r rune) bool {
+	if r < utf8.RuneSelf {
+		return r >= '0' && r <= '9'
+	}
+	return unicode.IsNumber(r)
+}
+
+func isCL100KSpace(r rune) bool {
+	if r < utf8.RuneSelf {
+		return r == ' ' || r == '\t' || r == '\n' || r == '\r' || r == '\v' || r == '\f'
+	}
+	return unicode.IsSpace(r)
+}
+
+func scanLetters(text string, pos int) int {
+	for pos < len(text) {
+		r, w := decodeAt(text, pos)
+		if !isCL100KLetter(r) {
+			break
+		}
+		pos += w
+	}
+	return pos
+}
+
+func scanPunctAndNewlines(text string, pos int) int {
+	for pos < len(text) {
+		r, w := decodeAt(text, pos)
+		if isCL100KSpace(r) || isCL100KLetter(r) || isCL100KNumber(r) {
+			break
+		}
+		pos += w
+	}
+	for pos < len(text) && (text[pos] == '\r' || text[pos] == '\n') {
+		pos++
+	}
+	return pos
+}
+
+// nextCL100KPiece advances across one piece matching the cl100k_base regex:
+// (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+func nextCL100KPiece(text string, pos int) int {
+	if text[pos] == '\'' && pos+1 < len(text) {
+		switch asciiLower(text[pos+1]) {
+		case 's', 't', 'm', 'd':
+			return pos + 2
+		case 'r', 'v':
+			if pos+2 < len(text) && asciiLower(text[pos+2]) == 'e' {
+				return pos + 3
+			}
+		case 'l':
+			if pos+2 < len(text) && asciiLower(text[pos+2]) == 'l' {
+				return pos + 3
+			}
+		}
+	}
+
+	r0, w0 := decodeAt(text, pos)
+
+	if isCL100KLetter(r0) {
+		return scanLetters(text, pos+w0)
+	}
+	if r0 != '\r' && r0 != '\n' && !isCL100KNumber(r0) {
+		if r1, w1 := decodeAt(text, pos+w0); w1 > 0 && isCL100KLetter(r1) {
+			return scanLetters(text, pos+w0+w1)
+		}
+	}
+
+	if isCL100KNumber(r0) {
+		end := pos + w0
+		for count := 1; count < 3 && end < len(text); count++ {
+			r, w := decodeAt(text, end)
+			if !isCL100KNumber(r) {
+				break
+			}
+			end += w
+		}
+		return end
+	}
+
+	if r0 == ' ' {
+		if r1, w1 := decodeAt(text, pos+1); w1 > 0 && !isCL100KSpace(r1) && !isCL100KLetter(r1) && !isCL100KNumber(r1) {
+			return scanPunctAndNewlines(text, pos+1+w1)
+		}
+	} else if !isCL100KSpace(r0) {
+		return scanPunctAndNewlines(text, pos+w0)
+	}
+
+	end := pos + w0
+	lastWSStart := pos
+	lastNewlineEnd := -1
+	if r0 == '\r' || r0 == '\n' {
+		lastNewlineEnd = end
+	}
+	for end < len(text) {
+		r, w := decodeAt(text, end)
+		if !isCL100KSpace(r) {
+			break
+		}
+		lastWSStart = end
+		end += w
+		if r == '\r' || r == '\n' {
+			lastNewlineEnd = end
+		}
+	}
+	if lastNewlineEnd >= 0 {
+		return lastNewlineEnd
+	}
+	if end == len(text) {
+		return end
+	}
+	if lastWSStart > pos {
+		return lastWSStart
+	}
+	return end
+}
+
+func bpePairRank(piece string, parts [][2]int, ranks map[string]int, startIdx, skip int) int {
+	if startIdx+skip+2 < len(parts) {
+		if rank, ok := ranks[piece[parts[startIdx][0]:parts[startIdx+skip+2][0]]]; ok {
+			return rank
+		}
+	}
+	return -1
+}
+
+func bytePairMergeCount(piece string, ranks map[string]int) int {
+	if len(piece) <= 1 {
+		return len(piece)
+	}
+	if len(piece) > maxSmallBPEPiece {
+		return len(bytePairMergeLarge(piece, ranks)) - 1
+	}
+	var stackBuf [64][2]int
+	var parts [][2]int
+	if len(piece)+1 <= len(stackBuf) {
+		parts = stackBuf[:len(piece)+1]
+	} else {
+		parts = make([][2]int, len(piece)+1)
+	}
+	for i := 0; i < len(parts); i++ {
+		parts[i][0], parts[i][1] = i, math.MaxInt
+	}
+
+	for i := 0; i < len(parts)-2; i++ {
+		if rank := bpePairRank(piece, parts, ranks, i, 0); rank >= 0 {
+			parts[i][1] = rank
+		}
+	}
+
+	for len(parts) > 1 {
+		minRank, minIdx := math.MaxInt, -1
+		for i := 0; i < len(parts)-1; i++ {
+			if parts[i][1] < minRank {
+				minRank, minIdx = parts[i][1], i
+			}
+		}
+		if minRank >= math.MaxInt {
+			break
+		}
+		i := minIdx
+		if rank := bpePairRank(piece, parts, ranks, i, 1); rank >= 0 {
+			parts[i][1] = rank
+		} else {
+			parts[i][1] = math.MaxInt
+		}
+		if i > 0 {
+			if rk := bpePairRank(piece, parts, ranks, i-1, 1); rk >= 0 {
+				parts[i-1][1] = rk
+			} else {
+				parts[i-1][1] = math.MaxInt
+			}
+		}
+		parts = append(parts[:i+1], parts[i+2:]...)
+	}
+
+	return len(parts) - 1
+}
+
+type bpeHeapItem struct {
+	rank    int
+	pos     int
+	spanEnd int
+}
+
+type bpeMinHeap []bpeHeapItem
+
+func (h bpeMinHeap) Len() int { return len(h) }
+func (h bpeMinHeap) Less(i, j int) bool {
+	if h[i].rank != h[j].rank {
+		return h[i].rank < h[j].rank
+	}
+	return h[i].pos < h[j].pos
+}
+func (h bpeMinHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *bpeMinHeap) Push(x any)   { *h = append(*h, x.(bpeHeapItem)) }
+func (h *bpeMinHeap) Pop() any {
+	old := *h
+	n := len(old)
+	it := old[n-1]
+	*h = old[:n-1]
+	return it
+}
+
+func bytePairMergeParts(piece string, ranks map[string]int) []int {
+	if len(piece) == 0 {
+		return []int{0}
+	}
+	if len(piece) == 1 {
+		return []int{0, 1}
+	}
+	if len(piece) > maxSmallBPEPiece {
+		return bytePairMergeLarge(piece, ranks)
+	}
+	parts := make([][2]int, len(piece)+1)
+	for i := 0; i < len(parts); i++ {
+		parts[i][0], parts[i][1] = i, math.MaxInt
+	}
+	for i := 0; i < len(parts)-2; i++ {
+		if rank := bpePairRank(piece, parts, ranks, i, 0); rank >= 0 {
+			parts[i][1] = rank
+		}
+	}
+	for len(parts) > 1 {
+		minRank, minIdx := math.MaxInt, -1
+		for i := 0; i < len(parts)-1; i++ {
+			if parts[i][1] < minRank {
+				minRank, minIdx = parts[i][1], i
+			}
+		}
+		if minRank >= math.MaxInt {
+			break
+		}
+		i := minIdx
+		if rank := bpePairRank(piece, parts, ranks, i, 1); rank >= 0 {
+			parts[i][1] = rank
+		} else {
+			parts[i][1] = math.MaxInt
+		}
+		if i > 0 {
+			if rk := bpePairRank(piece, parts, ranks, i-1, 1); rk >= 0 {
+				parts[i-1][1] = rk
+			} else {
+				parts[i-1][1] = math.MaxInt
+			}
+		}
+		parts = append(parts[:i+1], parts[i+2:]...)
+	}
+	out := make([]int, len(parts))
+	for i, p := range parts {
+		out[i] = p[0]
+	}
+	return out
+}
+
+func bytePairMergeLarge(piece string, ranks map[string]int) []int {
+	n := len(piece)
+	next := make([]int, n+1)
+	prev := make([]int, n+1)
+	rankAt := make([]int, n+1)
+	alive := make([]bool, n+1)
+	for i := 0; i <= n; i++ {
+		alive[i] = true
+		prev[i] = i - 1
+		if i < n {
+			next[i] = i + 1
+		} else {
+			next[i] = -1
+		}
+		rankAt[i] = math.MaxInt
+	}
+
+	h := make(bpeMinHeap, 0, n)
+	for i := 0; i <= n-2; i++ {
+		if rank, ok := ranks[piece[i:i+2]]; ok {
+			rankAt[i] = rank
+			h = append(h, bpeHeapItem{rank: rank, pos: i, spanEnd: i + 2})
+		}
+	}
+	heap.Init(&h)
+
+	updatePair := func(k int) {
+		if k < 0 || !alive[k] {
+			return
+		}
+		j := next[k]
+		if j < 0 || next[j] < 0 {
+			rankAt[k] = math.MaxInt
+			return
+		}
+		end := next[j]
+		if rank, ok := ranks[piece[k:end]]; ok {
+			rankAt[k] = rank
+			heap.Push(&h, bpeHeapItem{rank: rank, pos: k, spanEnd: end})
+		} else {
+			rankAt[k] = math.MaxInt
+		}
+	}
+
+	for h.Len() > 0 {
+		it := heap.Pop(&h).(bpeHeapItem)
+		i := it.pos
+		if !alive[i] || rankAt[i] != it.rank {
+			continue
+		}
+		j := next[i]
+		if j < 0 || next[j] != it.spanEnd {
+			continue
+		}
+		r := next[j]
+		alive[j] = false
+		next[i] = r
+		prev[r] = i
+		updatePair(i)
+		updatePair(prev[i])
+	}
+
+	out := make([]int, 0, n+1)
+	for cur := 0; cur >= 0; cur = next[cur] {
+		out = append(out, cur)
+	}
+	return out
 }
 
 // TruncateTokens truncates text to at most maxTokens cl100k_base tokens, reporting
@@ -74,32 +439,62 @@ func TruncateTokens(text string, maxTokens int) (string, bool) {
 	if maxTokens <= 0 {
 		return "", text != ""
 	}
-	enc, err := getEncoding()
-	if err != nil {
+	ranks, err := loadCL100KRanks()
+	if err != nil || len(ranks) == 0 {
 		if len(text) <= maxTokens*4 {
 			return text, false
 		}
-		return text[:maxTokens*4], true
-	}
-	ids := enc.EncodeOrdinary(text)
-	if len(ids) <= maxTokens {
-		return text, false
-	}
-	limit := maxTokens
-	for limit > 0 {
-		candidate := enc.Decode(ids[:limit])
-		// Ensure boundary decode yields valid UTF-8 without exceeding maxTokens upon re-encode.
-		candidate = strings.ToValidUTF8(candidate, "")
-		if candidate == "" {
-			limit--
-			continue
+		cut := maxTokens * 4
+		for cut > 0 && !utf8.RuneStart(text[cut]) {
+			cut--
 		}
-		if len(enc.EncodeOrdinary(candidate)) <= maxTokens {
-			return candidate, true
-		}
-		limit--
+		return strings.ToValidUTF8(text[:cut], ""), true
 	}
-	return "", true
+
+	total := 0
+	for pos := 0; pos < len(text); {
+		end := nextCL100KPiece(text, pos)
+		piece := text[pos:end]
+		var (
+			pieceTokens int
+			parts       []int
+		)
+		if _, ok := ranks[piece]; ok {
+			pieceTokens = 1
+		} else {
+			parts = bytePairMergeParts(piece, ranks)
+			pieceTokens = len(parts) - 1
+		}
+		if total+pieceTokens > maxTokens {
+			cut := pos
+			rem := maxTokens - total
+			if parts != nil && rem > 0 && rem < len(parts) {
+				cut = pos + parts[rem]
+			}
+			for cut > 0 {
+				for cut > 0 && !utf8.RuneStart(text[cut]) {
+					cut--
+				}
+				candidate := strings.ToValidUTF8(text[:cut], "")
+				if candidate != "" && CountTokens(candidate) <= maxTokens {
+					return candidate, true
+				}
+				if cut == 0 {
+					break
+				}
+				_, size := utf8.DecodeLastRuneInString(text[:cut])
+				if size <= 0 {
+					cut--
+				} else {
+					cut -= size
+				}
+			}
+			return "", true
+		}
+		total += pieceTokens
+		pos = end
+	}
+	return text, false
 }
 
 // IsValidTopicKey checks the slug format ^[a-z0-9][a-z0-9-]{0,127}$.

@@ -45,6 +45,7 @@ func NewServer(cfg config.Config, svc Service, mcpHandler http.Handler, logger *
 		Addr:              cfg.HTTPAddr,
 		Handler:           NewHandler(cfg, svc, mcpHandler, logger),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 }

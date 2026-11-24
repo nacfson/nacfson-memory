@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +13,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/pkoukk/tiktoken-go"
+	tiktoken_loader "github.com/pkoukk/tiktoken-go-loader"
 
 	"github.com/nacfson/nacfson-memory/internal/graph"
 	"github.com/nacfson/nacfson-memory/internal/storage"
@@ -519,5 +522,139 @@ func TestOpenAICuratorAndMockCurator(t *testing.T) {
 	}
 	if len(seenFormats) != 3 || seenFormats[0] != "json_schema" || seenFormats[1] != "json_object" || seenFormats[2] != "json_object" {
 		t.Fatalf("unexpected response_format sequence: %v", seenFormats)
+	}
+}
+
+func TestCountTokensMatchesTiktokenExact(t *testing.T) {
+	tiktoken.SetBpeLoader(tiktoken_loader.NewOfflineLoader())
+	enc, err := tiktoken.GetEncoding("cl100k_base")
+	if err != nil {
+		t.Fatalf("load cl100k_base reference encoding: %v", err)
+	}
+
+	samples := []string{
+		"",
+		"a",
+		"'",
+		"''",
+		"'''",
+		"'s",
+		"'S",
+		"'t",
+		"'T",
+		"'re",
+		"'RE",
+		"'Re",
+		"'ve",
+		"'VE",
+		"'m",
+		"'M",
+		"'ll",
+		"'LL",
+		"'d",
+		"'D",
+		"'sfoo",
+		"'REALLY",
+		"'a",
+		"'1",
+		"I'M",
+		"wouldn't've",
+		"hello world",
+		"I'll verify it's working; they're testing what we've built and shouldn't skip edge-cases.",
+		`{"memories":[{"memory_id":"019a0000-0000-7000-8000-000000000111","workspace_id":"ws-1","durability":"durable","topic_key":"primary-db","summary_stub":"PG 17","body":"Primary DB is PostgreSQL 17 with pgvector HALFVEC(1536)."}],"stubs":[],"manifest_etag":"W/\"ws:1+gen:0\"","workspace_revision":1,"degraded":false}`,
+		" ",
+		"  ",
+		"   ",
+		" 1",
+		"  1",
+		"   123",
+		"   1234",
+		"\t",
+		"\t1",
+		"\t\t 1",
+		"\t  foo",
+		"   foo",
+		"\u00a0foo",
+		"\u3000\u30001",
+		"\r\n",
+		"\n\r",
+		"  \r\n",
+		" \r\n  ",
+		"  \r\n  foo",
+		" \n \n  foo",
+		"!",
+		" !",
+		"  !",
+		"!foo",
+		" !foo",
+		"!?\r\n\n  bar",
+		" !\r\n\r",
+		"1234567890 42 3.1415926535 100ms 1536 HALFVEC(1536) ²³⁴",
+		"서울특별시 PostgreSQL 17 메모리 테스트 🚀✨ — em-dash & non-ASCII naïve résumé",
+		"alpha <|endoftext|> beta \r\n\t   gamma   \n\n\ndelta",
+		strings.Repeat("PostgreSQL 17 HNSW vector search & GIN lexical retrieval ", 40),
+		strings.Repeat("a", 1000),
+		strings.Repeat("ab", 350),
+		strings.Repeat("한글", 200),
+	}
+
+	rng := rand.New(rand.NewSource(42))
+	frags := []string{
+		"a", "Foo", "BAR", "0", "42", "9999", " ", "  ", "\t", "\r", "\n", "\r\n",
+		"'s", "'S", "'RE", "'ve", "'ll", "'m", "'d", "'", "!", "!?", ",", ":", "{", "}", `"`,
+		"한글", "🚀", "\u00a0", "\u3000", "memory_id", "_", "-", "\n  ", "  1",
+	}
+	for i := 0; i < 300; i++ {
+		var b strings.Builder
+		parts := 1 + rng.Intn(14)
+		for j := 0; j < parts; j++ {
+			b.WriteString(frags[rng.Intn(len(frags))])
+		}
+		samples = append(samples, b.String())
+	}
+
+	for i, s := range samples {
+		want := len(enc.EncodeOrdinary(s))
+		got := CountTokens(s)
+		if got != want {
+			t.Fatalf("sample[%d] token mismatch: CountTokens=%d want=%d text=%q", i, got, want, s)
+		}
+	}
+
+	// Verify lock-free concurrent execution under -race.
+	var wg sync.WaitGroup
+	for g := 0; g < 32; g++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				s := samples[(id+j)%len(samples)]
+				want := len(enc.EncodeOrdinary(s))
+				if got := CountTokens(s); got != want {
+					t.Errorf("concurrent mismatch (%d,%d): got=%d want=%d", id, j, got, want)
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	// Verify O(N log N) long unbroken piece performance and pure-Go TruncateTokens invariants.
+	start := time.Now()
+	longToks := CountTokens(strings.Repeat("a", 65536))
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond || longToks == 0 {
+		t.Fatalf("unexpected 64KiB single-piece BPE performance: toks=%d elapsed=%s", longToks, elapsed)
+	}
+	for _, tc := range []struct {
+		text      string
+		maxTokens int
+	}{
+		{"hello 🚀 world 🎉 and more tokens", 4},
+		{strings.Repeat("한글테스트", 60), 20},
+		{strings.Repeat("a", 500), 10},
+	} {
+		trunc, did := TruncateTokens(tc.text, tc.maxTokens)
+		if !did || CountTokens(trunc) > tc.maxTokens || CountTokens(trunc) != len(enc.EncodeOrdinary(trunc)) {
+			t.Fatalf("TruncateTokens(%d) invalid: did=%v got=%d enc=%d", tc.maxTokens, did, CountTokens(trunc), len(enc.EncodeOrdinary(trunc)))
+		}
 	}
 }

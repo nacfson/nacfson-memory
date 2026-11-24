@@ -512,6 +512,16 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any, allowEmpty 
 		writeJSONError(w, http.StatusBadRequest, "invalid_request", fmt.Sprintf("invalid JSON body: %v", err))
 		return false
 	}
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeJSONError(w, http.StatusRequestEntityTooLarge, "payload_too_large", fmt.Sprintf("request body exceeds %d bytes", maxErr.Limit))
+			return false
+		}
+		writeJSONError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body: trailing data")
+		return false
+	}
 	return true
 }
 

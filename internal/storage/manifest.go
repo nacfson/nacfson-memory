@@ -153,19 +153,20 @@ type ReviseMemoryParams struct {
 
 // EditMemoryParams configures partial manual edits via EditMemoryTx.
 type EditMemoryParams struct {
-	MemoryID         uuid.UUID
-	WorkspaceID      string // optional check if non-empty
-	ExpectedVersion  int
-	Durability       *string
-	SummaryStub      *string
-	Body             *string
-	TokenCount       *int
-	CurationState    string
-	Embedding        []float32
-	EmbeddingSpaceID string
-	AgentID          string
-	SourceAuthority  string
-	ChangeReason     string
+	MemoryID                 uuid.UUID
+	WorkspaceID              string // optional check if non-empty
+	ExpectedVersion          int
+	RequireCurrentDurability string // optional TOCTOU guard if non-empty
+	Durability               *string
+	SummaryStub              *string
+	Body                     *string
+	TokenCount               *int
+	CurationState            string
+	Embedding                []float32
+	EmbeddingSpaceID         string
+	AgentID                  string
+	SourceAuthority          string
+	ChangeReason             string
 }
 
 // SupersedeMemoryParams configures SupersedeMemoryTx.
@@ -190,9 +191,10 @@ type SupersedeMemoryParams struct {
 
 // SoftRetireParams configures SoftRetireTx.
 type SoftRetireParams struct {
-	MemoryID        uuid.UUID
-	WorkspaceID     string
-	ExpectedVersion int // optional when > 0
+	MemoryID           uuid.UUID
+	WorkspaceID        string
+	ExpectedVersion    int // optional when > 0
+	ForbidConstitution bool
 }
 
 // RevertMemoryParams configures RevertToVersionTx.
@@ -209,11 +211,13 @@ type RevertMemoryParams struct {
 
 // HardPurgeResult summarizes HardPurgeTx cleanup counts.
 type HardPurgeResult struct {
-	MemoryID          uuid.UUID          `json:"memory_id"`
-	WorkspaceID       string             `json:"workspace_id"`
-	Durability        string             `json:"durability"`
-	DeletedInboxCount int64              `json:"deleted_inbox_count"`
-	Revisions         WorkspaceRevisions `json:"revisions"`
+	MemoryID                uuid.UUID          `json:"memory_id"`
+	WorkspaceID             string             `json:"workspace_id"`
+	Durability              string             `json:"durability"`
+	InheritGeneral          string             `json:"inherit_general,omitempty"`
+	GeneralManifestRevision int64              `json:"general_manifest_revision,omitempty"`
+	DeletedInboxCount       int64              `json:"deleted_inbox_count"`
+	Revisions               WorkspaceRevisions `json:"revisions"`
 }
 
 // CurationDecision models a row in curation_decisions.
@@ -636,6 +640,9 @@ func EditMemoryTx(ctx context.Context, tx pgx.Tx, params EditMemoryParams) (Memo
 	if cur.CurrentVersion != params.ExpectedVersion {
 		return Memory{}, fmt.Errorf("expected version %d, found %d: %w", params.ExpectedVersion, cur.CurrentVersion, ErrVersionConflict)
 	}
+	if params.RequireCurrentDurability != "" && cur.Durability != params.RequireCurrentDurability {
+		return Memory{}, fmt.Errorf("invalid_action: expected durability %q, found %q: %w", params.RequireCurrentDurability, cur.Durability, ErrInvalidInput)
+	}
 
 	dur := cur.Durability
 	if params.Durability != nil && *params.Durability != "" {
@@ -800,6 +807,9 @@ func SoftRetireTx(ctx context.Context, tx pgx.Tx, params SoftRetireParams) (Memo
 	if params.ExpectedVersion > 0 && cur.CurrentVersion != params.ExpectedVersion {
 		return Memory{}, fmt.Errorf("expected version %d, found %d: %w", params.ExpectedVersion, cur.CurrentVersion, ErrVersionConflict)
 	}
+	if params.ForbidConstitution && cur.Durability == DurabilityConstitution {
+		return Memory{}, fmt.Errorf("invalid_action: cannot directly retire constitution memory %s: %w", params.MemoryID, ErrInvalidInput)
+	}
 
 	var m Memory
 	err = tx.QueryRow(ctx, `
@@ -943,6 +953,14 @@ func HardPurgeTx(ctx context.Context, tx pgx.Tx, memoryID uuid.UUID, reason stri
 	if _, err := LockWorkspaceTx(ctx, tx, workspaceID); err != nil {
 		return HardPurgeResult{}, err
 	}
+	var inheritGeneral string
+	if err := tx.QueryRow(ctx, `SELECT inherit_general FROM workspaces WHERE workspace_id = $1`, workspaceID).Scan(&inheritGeneral); err != nil {
+		return HardPurgeResult{}, fmt.Errorf("lookup workspace inherit_general on purge: %w", err)
+	}
+	var genManifestRev int64
+	if workspaceID != WorkspaceGeneral {
+		_ = tx.QueryRow(ctx, `SELECT manifest_revision FROM workspaces WHERE workspace_id = $1`, WorkspaceGeneral).Scan(&genManifestRev)
+	}
 
 	// Snapshot cited inbox_ids BEFORE deleting memory_manifest (which cascades memory_citations).
 	rows, err := tx.Query(ctx, `SELECT DISTINCT inbox_id FROM memory_citations WHERE memory_id = $1`, memoryID)
@@ -1020,11 +1038,13 @@ func HardPurgeTx(ctx context.Context, tx pgx.Tx, memoryID uuid.UUID, reason stri
 	}
 
 	return HardPurgeResult{
-		MemoryID:          memoryID,
-		WorkspaceID:       workspaceID,
-		Durability:        durability,
-		DeletedInboxCount: deletedInboxCount,
-		Revisions:         revs,
+		MemoryID:                memoryID,
+		WorkspaceID:             workspaceID,
+		Durability:              durability,
+		InheritGeneral:          inheritGeneral,
+		GeneralManifestRevision: genManifestRev,
+		DeletedInboxCount:       deletedInboxCount,
+		Revisions:               revs,
 	}, nil
 }
 

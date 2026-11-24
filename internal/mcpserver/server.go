@@ -352,11 +352,16 @@ func handleManage(ctx context.Context, svc Service, in ManageInput) (*mcp.CallTo
 		if detail.Memory.Durability == storage.DurabilityConstitution {
 			return nil, nil, rpcErr(codeInvalidParams, "invalid_action: cannot directly retire constitution memory via agent_observed; use privileged purge or manual edit")
 		}
+		reason := strings.TrimSpace(in.Reason)
+		if reason == "" {
+			reason = "agent_retire"
+		}
 		res, err := svc.SoftRetire(ctx, service.SoftRetireRequest{
-			MemoryID:        targetID,
-			WorkspaceID:     in.WorkspaceID,
-			ExpectedVersion: in.ExpectedVersion,
-			Reason:          in.Reason,
+			MemoryID:           targetID,
+			WorkspaceID:        in.WorkspaceID,
+			ExpectedVersion:    in.ExpectedVersion,
+			ForbidConstitution: true,
+			Reason:             reason,
 		})
 		if err != nil {
 			return nil, nil, mapServiceErr(err)
@@ -374,7 +379,8 @@ func handleManage(ctx context.Context, svc Service, in ManageInput) (*mcp.CallTo
 		if err != nil {
 			return nil, nil, err
 		}
-		if err := consumeToken(ctx, svc, in.ConfirmationToken, in.WorkspaceID, "create", nil); err != nil {
+		tok, err := buildConfirmToken(in.ConfirmationToken, in.WorkspaceID, "create", nil)
+		if err != nil {
 			return nil, nil, err
 		}
 		stub := ""
@@ -382,14 +388,15 @@ func handleManage(ctx context.Context, svc Service, in ManageInput) (*mcp.CallTo
 			stub = *in.SummaryStub
 		}
 		res, err := svc.ManualCreate(ctx, service.ManualCreateRequest{
-			WorkspaceID: in.WorkspaceID,
-			Durability:  storage.DurabilityConstitution,
-			Category:    in.Category,
-			TopicKey:    in.TopicKey,
-			SummaryStub: stub,
-			Body:        *in.Body,
-			DependsOn:   deps,
-			Reason:      in.Reason,
+			WorkspaceID:  in.WorkspaceID,
+			Durability:   storage.DurabilityConstitution,
+			Category:     in.Category,
+			TopicKey:     in.TopicKey,
+			SummaryStub:  stub,
+			Body:         *in.Body,
+			DependsOn:    deps,
+			Reason:       in.Reason,
+			ConfirmToken: tok,
 		})
 		if err != nil {
 			return nil, nil, mapServiceErr(err)
@@ -421,19 +428,23 @@ func handleManage(ctx context.Context, svc Service, in ManageInput) (*mcp.CallTo
 		if d := strings.TrimSpace(in.Durability); d != "" && d != storage.DurabilityConstitution {
 			return nil, nil, rpcErr(codeInvalidParams, "invalid_action: edit via memory_manage only supports constitution durability")
 		}
-		if err := consumeToken(ctx, svc, in.ConfirmationToken, in.WorkspaceID, "edit", &targetID); err != nil {
+		tok, err := buildConfirmToken(in.ConfirmationToken, in.WorkspaceID, "edit", &targetID)
+		if err != nil {
 			return nil, nil, err
 		}
 		constDur := storage.DurabilityConstitution
 		res, err := svc.ManualEdit(ctx, service.ManualEditRequest{
-			MemoryID:        targetID,
-			ExpectedVersion: in.ExpectedVersion,
-			Durability:      &constDur,
-			Category:        in.Category,
-			SummaryStub:     in.SummaryStub,
-			Body:            in.Body,
-			DependsOn:       deps,
-			Reason:          in.Reason,
+			WorkspaceID:              in.WorkspaceID,
+			MemoryID:                 targetID,
+			ExpectedVersion:          in.ExpectedVersion,
+			RequireCurrentDurability: storage.DurabilityConstitution,
+			Durability:               &constDur,
+			Category:                 in.Category,
+			SummaryStub:              in.SummaryStub,
+			Body:                     in.Body,
+			DependsOn:                deps,
+			Reason:                   in.Reason,
+			ConfirmToken:             tok,
 		})
 		if err != nil {
 			return nil, nil, mapServiceErr(err)
@@ -462,11 +473,13 @@ func handleManage(ctx context.Context, svc Service, in ManageInput) (*mcp.CallTo
 		if detail.Memory.WorkspaceID != in.WorkspaceID {
 			return nil, nil, rpcErr(codeUnprocessable, fmt.Sprintf("memory %s does not belong to workspace %q", targetID, in.WorkspaceID))
 		}
-		if err := consumeToken(ctx, svc, in.ConfirmationToken, in.WorkspaceID, "promote", &targetID); err != nil {
+		tok, err := buildConfirmToken(in.ConfirmationToken, in.WorkspaceID, "promote", &targetID)
+		if err != nil {
 			return nil, nil, err
 		}
 		constDur := storage.DurabilityConstitution
 		res, err := svc.ManualEdit(ctx, service.ManualEditRequest{
+			WorkspaceID:     in.WorkspaceID,
 			MemoryID:        targetID,
 			ExpectedVersion: in.ExpectedVersion,
 			Durability:      &constDur,
@@ -475,6 +488,7 @@ func handleManage(ctx context.Context, svc Service, in ManageInput) (*mcp.CallTo
 			Body:            in.Body,
 			DependsOn:       deps,
 			Reason:          in.Reason,
+			ConfirmToken:    tok,
 		})
 		if err != nil {
 			return nil, nil, mapServiceErr(err)
@@ -496,14 +510,17 @@ func handleManage(ctx context.Context, svc Service, in ManageInput) (*mcp.CallTo
 		if detail.Memory.WorkspaceID != in.WorkspaceID {
 			return nil, nil, rpcErr(codeUnprocessable, fmt.Sprintf("memory %s does not belong to workspace %q", targetID, in.WorkspaceID))
 		}
-		if err := consumeToken(ctx, svc, in.ConfirmationToken, in.WorkspaceID, "revert", &targetID); err != nil {
+		tok, err := buildConfirmToken(in.ConfirmationToken, in.WorkspaceID, "revert", &targetID)
+		if err != nil {
 			return nil, nil, err
 		}
 		res, err := svc.RevertMemory(ctx, service.RevertMemoryRequest{
+			WorkspaceID:     in.WorkspaceID,
 			MemoryID:        targetID,
 			ExpectedVersion: in.ExpectedVersion,
 			TargetVersion:   in.TargetVersion,
 			Reason:          in.Reason,
+			ConfirmToken:    tok,
 		})
 		if err != nil {
 			return nil, nil, mapServiceErr(err)
@@ -522,13 +539,16 @@ func handleManage(ctx context.Context, svc Service, in ManageInput) (*mcp.CallTo
 		if detail.Memory.WorkspaceID != in.WorkspaceID {
 			return nil, nil, rpcErr(codeUnprocessable, fmt.Sprintf("memory %s does not belong to workspace %q", targetID, in.WorkspaceID))
 		}
-		if err := consumeToken(ctx, svc, in.ConfirmationToken, in.WorkspaceID, "purge", &targetID); err != nil {
+		tok, err := buildConfirmToken(in.ConfirmationToken, in.WorkspaceID, "purge", &targetID)
+		if err != nil {
 			return nil, nil, err
 		}
 		res, err := svc.HardPurge(ctx, service.HardPurgeRequest{
-			MemoryID: targetID,
-			Confirm:  true,
-			Reason:   in.Reason,
+			WorkspaceID:  in.WorkspaceID,
+			MemoryID:     targetID,
+			Confirm:      true,
+			Reason:       in.Reason,
+			ConfirmToken: tok,
 		})
 		if err != nil {
 			return nil, nil, mapServiceErr(err)
@@ -537,7 +557,7 @@ func handleManage(ctx context.Context, svc Service, in ManageInput) (*mcp.CallTo
 			MemoryID:          res.MemoryID,
 			WorkspaceID:       res.WorkspaceID,
 			Status:            "purged",
-			ManifestETag:      storage.ComputeMetadataETag(res.Revisions.ManifestRevision, 0, storage.InheritNone),
+			ManifestETag:      storage.ComputeMetadataETag(res.Revisions.ManifestRevision, res.GeneralManifestRevision, res.InheritGeneral),
 			Purged:            true,
 			DeletedInboxCount: res.DeletedInboxCount,
 		}, nil
@@ -566,19 +586,16 @@ func parseManageEdges(in []ManageEdgeInput) ([]graph.EdgeSpec, error) {
 	return out, nil
 }
 
-func consumeToken(ctx context.Context, svc Service, rawToken, wsID, action string, targetID *uuid.UUID) error {
+func buildConfirmToken(rawToken, wsID, action string, targetID *uuid.UUID) (*service.ConsumeConfirmTokenRequest, error) {
 	if strings.TrimSpace(rawToken) == "" {
-		return rpcErr(codeInvalidParams, "confirmation_token is required for privileged memory_manage action")
+		return nil, rpcErr(codeInvalidParams, "confirmation_token is required for privileged memory_manage action")
 	}
-	if err := svc.ConsumeConfirmToken(ctx, service.ConsumeConfirmTokenRequest{
+	return &service.ConsumeConfirmTokenRequest{
 		Token:          rawToken,
 		WorkspaceID:    wsID,
 		Action:         action,
 		TargetMemoryID: targetID,
-	}); err != nil {
-		return mapServiceErr(err)
-	}
-	return nil
+	}, nil
 }
 
 func parseRequiredTarget(raw string) (uuid.UUID, error) {

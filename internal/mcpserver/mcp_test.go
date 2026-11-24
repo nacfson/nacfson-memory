@@ -362,6 +362,65 @@ func TestStreamableHTTPAndStdioSubprocessIntegration(t *testing.T) {
 		t.Fatalf("privileged revert failed: out=%+v err=%v", revOut, err)
 	}
 
+	// Retryable atomic confirmation_token: failed CAS revert must NOT burn the token.
+	revTok2 := mintTokenViaHTTP(t, httpSrv.URL, cfg.AdminToken, "payments", "revert", &durMem.MemoryID)
+	_, err = callToolJSON[mcpserver.ManageOutput](t, ctx, session, "memory_manage", map[string]any{
+		"workspace_id":       "payments",
+		"action":             "revert",
+		"target_memory_id":   durMem.MemoryID.String(),
+		"expected_version":   99,
+		"target_version":     1,
+		"confirmation_token": revTok2,
+	})
+	assertJSONRPCCode(t, err, -32022, "")
+	revOut2, err := callToolJSON[mcpserver.ManageOutput](t, ctx, session, "memory_manage", map[string]any{
+		"workspace_id":       "payments",
+		"action":             "revert",
+		"target_memory_id":   durMem.MemoryID.String(),
+		"expected_version":   4,
+		"target_version":     1,
+		"confirmation_token": revTok2,
+	})
+	if err != nil || revOut2.Version != 5 {
+		t.Fatalf("retry revert with unburned token failed: out=%+v err=%v", revOut2, err)
+	}
+
+	// Verify MCP direct retire recorded "agent_retire" rationale in audit lineage.
+	workLineage, err := svc.ExplainLineage(ctx, workMem.MemoryID)
+	if err != nil {
+		t.Fatalf("explain retired workMem: %v", err)
+	}
+	sawAgentRetire := false
+	for _, d := range workLineage.Decisions {
+		if d.Action == "retire" && d.Rationale == "agent_retire" {
+			sawAgentRetire = true
+		}
+	}
+	if !sawAgentRetire {
+		t.Fatalf("expected agent_retire decision in workMem lineage, got %+v", workLineage.Decisions)
+	}
+
+	// Verify memory_manage(purge) returns workspace inheritance +general ETag.
+	tmpMem, err := svc.ManualCreate(ctx, service.ManualCreateRequest{
+		WorkspaceID: "payments",
+		Durability:  storage.DurabilityDurable,
+		TopicKey:    "purge-etag-check",
+		Body:        "Temporary durable item for purge ETag verification.",
+	})
+	if err != nil {
+		t.Fatalf("create tmpMem: %v", err)
+	}
+	purgeTok := mintTokenViaHTTP(t, httpSrv.URL, cfg.AdminToken, "payments", "purge", &tmpMem.MemoryID)
+	purgeOut, err := callToolJSON[mcpserver.ManageOutput](t, ctx, session, "memory_manage", map[string]any{
+		"workspace_id":       "payments",
+		"action":             "purge",
+		"target_memory_id":   tmpMem.MemoryID.String(),
+		"confirmation_token": purgeTok,
+	})
+	if err != nil || !purgeOut.Purged || !strings.Contains(purgeOut.ManifestETag, "+gen:") {
+		t.Fatalf("expected purged response with +gen: ETag, got out=%+v err=%v", purgeOut, err)
+	}
+
 	// 5. Resource read mem1://workspaces/payments/constitution
 	rRes, err := session.ReadResource(ctx, &mcp.ReadResourceParams{
 		URI: "mem1://workspaces/payments/constitution",

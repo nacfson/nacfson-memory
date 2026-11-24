@@ -62,7 +62,7 @@ func HostOriginMiddleware(allowedHosts []string, next http.Handler) http.Handler
 
 		if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
 			u, err := url.Parse(origin)
-			if err != nil || u.Host == "" {
+			if err != nil || u.Host == "" || u.User != nil || (!strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https")) {
 				writeJSONError(w, http.StatusForbidden, "forbidden", "invalid Origin header")
 				return
 			}
@@ -94,6 +94,10 @@ func normalizeHost(raw string) string {
 	return s
 }
 
+func isMCPPath(path string) bool {
+	return path == "/mcp" || strings.HasPrefix(path, "/mcp/")
+}
+
 // AuthMiddleware enforces split Bearer tokens: /healthz open, /v1/* mandatory adminToken,
 // and /mcp agentToken when configured.
 func AuthMiddleware(adminToken, agentToken string, next http.Handler) http.Handler {
@@ -103,7 +107,7 @@ func AuthMiddleware(adminToken, agentToken string, next http.Handler) http.Handl
 		case path == "/healthz":
 			next.ServeHTTP(w, r)
 			return
-		case path == "/mcp" || strings.HasPrefix(path, "/mcp/"):
+		case isMCPPath(path):
 			if agentToken != "" && !bearerMatch(r.Header.Get("Authorization"), agentToken) {
 				writeJSONError(w, http.StatusUnauthorized, "unauthorized", "valid MEM1_AGENT_TOKEN bearer token required")
 				return
@@ -153,7 +157,7 @@ func InflightMiddleware(maxInflight int, inflight *atomic.Int64, next http.Handl
 		defer inflight.Add(-1)
 
 		if cur > int64(maxInflight) {
-			if strings.HasPrefix(r.URL.Path, "/mcp") {
+			if isMCPPath(r.URL.Path) {
 				req := r.WithContext(mcpserver.WithInflightSaturated(r.Context()))
 				next.ServeHTTP(w, req)
 				return
@@ -170,7 +174,7 @@ func InflightMiddleware(maxInflight int, inflight *atomic.Int64, next http.Handl
 func BodyLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		limit := MaxAdminBodyBytes
-		if strings.HasPrefix(r.URL.Path, "/mcp") {
+		if isMCPPath(r.URL.Path) {
 			limit = MaxMCPBodyBytes
 		}
 		if r.ContentLength > limit {
@@ -185,13 +189,14 @@ func BodyLimitMiddleware(next http.Handler) http.Handler {
 }
 
 type bufferedMCPWriter struct {
-	mu        sync.Mutex
-	dst       http.ResponseWriter
-	degraded  *atomic.Bool
-	header    http.Header
-	status    int
-	buf       bytes.Buffer
-	streaming bool
+	mu          sync.Mutex
+	dst         http.ResponseWriter
+	degraded    *atomic.Bool
+	header      http.Header
+	status      int
+	wroteHeader bool
+	buf         bytes.Buffer
+	streaming   bool
 }
 
 func newBufferedMCPWriter(dst http.ResponseWriter, degraded *atomic.Bool) *bufferedMCPWriter {
@@ -222,6 +227,7 @@ func (b *bufferedMCPWriter) applyHeadersLocked() {
 
 func (b *bufferedMCPWriter) promoteToStreamingLocked() {
 	b.streaming = true
+	b.wroteHeader = true
 	b.applyHeadersLocked()
 	b.dst.WriteHeader(b.status)
 	if b.buf.Len() > 0 {
@@ -243,17 +249,20 @@ func (b *bufferedMCPWriter) Header() http.Header {
 func (b *bufferedMCPWriter) WriteHeader(statusCode int) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if !b.streaming {
-		b.status = statusCode
-		if b.isSSELocked() {
-			b.promoteToStreamingLocked()
-		}
+	if b.streaming || b.wroteHeader {
+		return
+	}
+	b.wroteHeader = true
+	b.status = statusCode
+	if b.isSSELocked() {
+		b.promoteToStreamingLocked()
 	}
 }
 
 func (b *bufferedMCPWriter) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.wroteHeader = true
 	if !b.streaming && b.isSSELocked() {
 		b.promoteToStreamingLocked()
 	}
@@ -291,7 +300,7 @@ func (b *bufferedMCPWriter) finish() {
 // while flushing SSE streams (e.g. subscriptions/listen) immediately without deadlocking.
 func MCPDegradedBufferMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.URL.Path, "/mcp") {
+		if !isMCPPath(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}

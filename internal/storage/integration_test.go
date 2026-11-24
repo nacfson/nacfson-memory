@@ -1000,9 +1000,21 @@ func TestStorageEdgePathsPaginationAndJobs(t *testing.T) {
 		t.Fatalf("expected stale-version embedding update to return false, ok=%v err=%v", ok, err)
 	}
 
+	// TOCTOU guards: ForbidConstitution and RequireCurrentDurability enforced under row lock.
+	if _, err := storage.SoftRetireTx(ctx, etx, storage.SoftRetireParams{
+		MemoryID: memConst.MemoryID, WorkspaceID: "wsedge", ForbidConstitution: true,
+	}); !errors.Is(err, storage.ErrInvalidInput) {
+		t.Fatalf("expected ErrInvalidInput forbidding constitution retire, got %v", err)
+	}
+	if _, err := storage.EditMemoryTx(ctx, etx, storage.EditMemoryParams{
+		MemoryID: memConst.MemoryID, WorkspaceID: "wsedge", ExpectedVersion: 1, RequireCurrentDurability: storage.DurabilityDurable,
+	}); !errors.Is(err, storage.ErrInvalidInput) {
+		t.Fatalf("expected ErrInvalidInput on durability mismatch, got %v", err)
+	}
+
 	cPurge, err := storage.HardPurgeTx(ctx, etx, memConst.MemoryID, "")
-	if err != nil || cPurge.Revisions.ConstitutionRevision != 1 {
-		t.Fatalf("expected constitution_revision bumped to 1, got %+v err=%v", cPurge, err)
+	if err != nil || cPurge.Revisions.ConstitutionRevision != 1 || cPurge.InheritGeneral == "" {
+		t.Fatalf("expected constitution_revision=1 and inherit_general set, got %+v err=%v", cPurge, err)
 	}
 	if err := etx.Commit(ctx); err != nil {
 		t.Fatalf("commit etx: %v", err)
