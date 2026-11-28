@@ -63,21 +63,15 @@ func TestCuratorTokenUsageBilledOncePerBatchAndFailedAttemptsLogged(t *testing.T
 	var failWSCalls, transientWSCalls atomic.Int32
 	sc := &scriptCurator{fn: func(ctx context.Context, req curation.CurateRequest) (curation.CuratePlan, error) {
 		if req.WorkspaceID == "tokens-transient" && transientWSCalls.Add(1) == 1 {
-			return curation.CuratePlan{}, &curation.CurateAttemptError{
-				ProviderName:     "deepseek",
-				ModelName:        "deepseek-chat",
-				PromptTokens:     640,
-				CompletionTokens: 90,
-				Err:              errors.New("curator endpoint returned HTTP 503: repair call overloaded"),
+			return curation.CuratePlan{}, &curation.CurateUsageError{
+				Usage: curation.CurateUsage{ProviderName: "deepseek", ModelName: "deepseek-chat", PromptTokens: 640, CompletionTokens: 90, APICalls: 2},
+				Err:   errors.New("curator endpoint returned HTTP 503: repair call overloaded"),
 			}
 		}
 		if req.WorkspaceID == "tokens-fail" && failWSCalls.Add(1) == 1 {
-			return curation.CuratePlan{}, &curation.CurateAttemptError{
-				ProviderName:     "deepseek",
-				ModelName:        "deepseek-chat",
-				PromptTokens:     612,
-				CompletionTokens: 143,
-				Err:              fmt.Errorf("%w: field mutations.0.depends_on.0.expected_to_rev must be an integer, got bool", curation.ErrMalformedPlan),
+			return curation.CuratePlan{}, &curation.CurateUsageError{
+				Usage: curation.CurateUsage{ProviderName: "deepseek", ModelName: "deepseek-chat", PromptTokens: 612, CompletionTokens: 143, APICalls: 2},
+				Err:   fmt.Errorf("%w: field mutations.0.depends_on.0.expected_to_rev must be an integer, got bool", curation.ErrMalformedPlan),
 			}
 		}
 		plan, err := curation.NewMockCurator().CurateBatch(ctx, req)

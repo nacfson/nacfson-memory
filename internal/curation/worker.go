@@ -388,9 +388,9 @@ func (w *CurateWorkspaceWorker) processBatch(
 
 	plan, err := w.deps.Curator.CurateBatch(ctx, req)
 	if err != nil {
-		var attemptErr *CurateAttemptError
-		if errors.As(err, &attemptErr) {
-			w.logUnbilledUsage(snap.workspace.WorkspaceID, attemptErr.ProviderName, attemptErr.ModelName, attemptErr.PromptTokens, attemptErr.CompletionTokens,
+		var usageErr *CurateUsageError
+		if errors.As(err, &usageErr) {
+			w.logUnbilledUsage(snap.workspace.WorkspaceID, usageErr.Usage.ProviderName, usageErr.Usage.ModelName, usageErr.Usage.PromptTokens, usageErr.Usage.CompletionTokens,
 				"attempt", job.Attempt, "max_attempts", job.MaxAttempts, "inbox_items", len(subItems), "err", err)
 		}
 		if !errors.Is(err, ErrPlanValidation) {

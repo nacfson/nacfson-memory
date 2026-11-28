@@ -199,12 +199,16 @@ func (c *OpenAICurator) CurateBatch(ctx context.Context, req CurateRequest) (Cur
 		{Role: "user", Content: string(userJSON)},
 	}
 
-	content, promptTok, completionTok, err := c.invokeAndDecode(reqCtx, messages)
+	usage := CurateUsage{ProviderName: c.providerName, ModelName: c.model}
+	content, decoded, err := c.invokeAndDecode(reqCtx, messages, &usage)
 	if err != nil {
-		return CuratePlan{}, c.attemptError(promptTok, completionTok, err)
+		if !decoded {
+			return CuratePlan{}, err
+		}
+		return CuratePlan{}, &CurateUsageError{Usage: usage, Err: err}
 	}
 
-	plan, valErr := c.compileAndValidate(req, aliases, content, promptTok, completionTok)
+	plan, valErr := c.compileAndValidate(req, aliases, content, usage)
 	if valErr == nil {
 		return plan, nil
 	}
@@ -230,52 +234,25 @@ func (c *OpenAICurator) CurateBatch(ctx context.Context, req CurateRequest) (Cur
 			{Role: "assistant", Content: badAssistant},
 			{Role: "user", Content: repairPrompt},
 		}
-		rContent, rPromptTok, rCompTok, rErr := c.invokeAndDecode(reqCtx, repairMsgs)
-		promptTok += rPromptTok
-		completionTok += rCompTok
+		rContent, _, rErr := c.invokeAndDecode(reqCtx, repairMsgs, &usage)
 		if rErr != nil {
-			return CuratePlan{}, c.attemptError(promptTok, completionTok, rErr)
+			return CuratePlan{}, &CurateUsageError{Usage: usage, Err: rErr}
 		}
-		plan, valErr = c.compileAndValidate(req, aliases, rContent, promptTok, completionTok)
+		plan, valErr = c.compileAndValidate(req, aliases, rContent, usage)
 		if valErr == nil {
 			return plan, nil
 		}
 	}
 
-	return CuratePlan{}, c.attemptError(promptTok, completionTok, valErr)
+	return CuratePlan{}, &CurateUsageError{Usage: usage, Err: valErr}
 }
 
-// attemptError attaches tokens the provider already billed to a CurateBatch failure.
-func (c *OpenAICurator) attemptError(promptTok, completionTok int, err error) error {
-	if promptTok == 0 && completionTok == 0 {
-		return err
-	}
-	return &CurateAttemptError{
-		ProviderName:     c.providerName,
-		ModelName:        c.model,
-		PromptTokens:     promptTok,
-		CompletionTokens: completionTok,
-		Err:              err,
-	}
-}
-
-func (c *OpenAICurator) compileAndValidate(
-	req CurateRequest,
-	aliases AliasTable,
-	rawContent string,
-	promptTok, completionTok int,
-) (CuratePlan, error) {
+func (c *OpenAICurator) compileAndValidate(req CurateRequest, aliases AliasTable, rawContent string, usage CurateUsage) (CuratePlan, error) {
 	mutations, err := CompileRawPlan(aliases, rawContent)
 	if err != nil {
 		return CuratePlan{}, err
 	}
-	plan := CuratePlan{
-		ProviderName:     c.providerName,
-		ModelName:        c.model,
-		PromptTokens:     promptTok,
-		CompletionTokens: completionTok,
-		Mutations:        mutations,
-	}
+	plan := CuratePlan{CurateUsage: usage, Mutations: mutations}
 	if len(req.InboxItems) > 0 {
 		if err := ValidatePlan(localValidationContext(req), plan); err != nil {
 			return CuratePlan{}, err
@@ -307,27 +284,32 @@ func localValidationContext(req CurateRequest) ValidationContext {
 	}
 }
 
-func (c *OpenAICurator) invokeAndDecode(ctx context.Context, messages []chatMessage) (string, int, int, error) {
+// invokeAndDecode issues one chat completion call and adds it to usage. decoded reports
+// whether a 2xx response envelope was decoded, which is when the provider reports usage.
+func (c *OpenAICurator) invokeAndDecode(ctx context.Context, messages []chatMessage, usage *CurateUsage) (content string, decoded bool, err error) {
+	usage.APICalls++
 	status, body, err := c.sendChatWithFormatFallback(ctx, messages)
 	if err != nil {
-		return "", 0, 0, err
+		return "", false, err
 	}
 	if status < 200 || status >= 300 {
 		snippet := strings.TrimSpace(string(body))
 		if len(snippet) > 512 {
 			snippet = snippet[:512] + "..."
 		}
-		return "", 0, 0, fmt.Errorf("curator endpoint returned HTTP %d: %s", status, snippet)
+		return "", false, fmt.Errorf("curator endpoint returned HTTP %d: %s", status, snippet)
 	}
 
-	var decoded chatCompletionResponse
-	if err := json.Unmarshal(body, &decoded); err != nil {
-		return "", 0, 0, fmt.Errorf("%w: decode response envelope: %v", ErrMalformedPlan, err)
+	var resp chatCompletionResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return "", false, fmt.Errorf("%w: decode response envelope: %v", ErrMalformedPlan, err)
 	}
-	if len(decoded.Choices) == 0 || strings.TrimSpace(decoded.Choices[0].Message.Content) == "" {
-		return "", decoded.Usage.PromptTokens, decoded.Usage.CompletionTokens, fmt.Errorf("%w: missing choices content", ErrMalformedPlan)
+	usage.PromptTokens += resp.Usage.PromptTokens
+	usage.CompletionTokens += resp.Usage.CompletionTokens
+	if len(resp.Choices) == 0 || strings.TrimSpace(resp.Choices[0].Message.Content) == "" {
+		return "", true, fmt.Errorf("%w: missing choices content", ErrMalformedPlan)
 	}
-	return decoded.Choices[0].Message.Content, decoded.Usage.PromptTokens, decoded.Usage.CompletionTokens, nil
+	return resp.Choices[0].Message.Content, true, nil
 }
 
 func (c *OpenAICurator) sendChatWithFormatFallback(ctx context.Context, messages []chatMessage) (int, []byte, error) {
@@ -563,9 +545,8 @@ func (m *MockCurator) CurateBatch(ctx context.Context, req CurateRequest) (Curat
 	}
 
 	return CuratePlan{
-		ProviderName: "mock",
-		ModelName:    "mock-curator-v1",
-		Mutations:    mutations,
+		CurateUsage: CurateUsage{ProviderName: "mock", ModelName: "mock-curator-v1"},
+		Mutations:   mutations,
 	}, nil
 }
 

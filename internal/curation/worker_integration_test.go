@@ -451,7 +451,7 @@ func TestMidFlightConflictSavepointIsolation(t *testing.T) {
 						})
 					}
 				}
-				return curation.CuratePlan{ProviderName: "mock", ModelName: "script", Mutations: muts}, nil
+				return curation.CuratePlan{CurateUsage: curation.CurateUsage{ProviderName: "mock", ModelName: "script"}, Mutations: muts}, nil
 			}
 			// On follow-up after conflict re-enqueue, emit noop so inbox finishes cleanly.
 			ids := make([]uuid.UUID, len(req.InboxItems))
@@ -459,8 +459,8 @@ func TestMidFlightConflictSavepointIsolation(t *testing.T) {
 				ids[i] = it.InboxID
 			}
 			return curation.CuratePlan{
-				ProviderName: "mock", ModelName: "script",
-				Mutations: []curation.CurateMutation{{InboxIDs: ids, Action: curation.ActionNoop, Rationale: "reconciled after manual edit"}},
+				CurateUsage: curation.CurateUsage{ProviderName: "mock", ModelName: "script"},
+				Mutations:   []curation.CurateMutation{{InboxIDs: ids, Action: curation.ActionNoop, Rationale: "reconciled after manual edit"}},
 			}, nil
 		},
 	}

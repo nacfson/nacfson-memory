@@ -572,26 +572,30 @@ type CurateRequest struct {
 
 // CuratePlan captures the structured output and token telemetry from a Curator invocation.
 type CuratePlan struct {
-	ProviderName     string           `json:"provider_name"`
-	ModelName        string           `json:"model_name"`
-	PromptTokens     int              `json:"prompt_tokens"`
-	CompletionTokens int              `json:"completion_tokens"`
-	Mutations        []CurateMutation `json:"mutations"`
+	CurateUsage
+	Mutations []CurateMutation `json:"mutations"`
 }
 
-// CurateAttemptError is a failed CurateBatch call that had already consumed provider tokens,
-// so the worker can account for usage that no curation_decisions row will carry.
-type CurateAttemptError struct {
-	ProviderName     string
-	ModelName        string
-	PromptTokens     int
-	CompletionTokens int
-	Err              error
+// CurateUsage is the provider usage of one CurateBatch invocation, summed over its initial
+// call and its repair call when one ran.
+type CurateUsage struct {
+	ProviderName     string `json:"provider_name"`
+	ModelName        string `json:"model_name"`
+	PromptTokens     int    `json:"prompt_tokens"`
+	CompletionTokens int    `json:"completion_tokens"`
+	APICalls         int    `json:"api_calls"`
 }
 
-func (e *CurateAttemptError) Error() string { return e.Err.Error() }
+// CurateUsageError is a failed CurateBatch whose provider already returned at least one
+// decoded response, so the caller can account for usage no curation_decisions row carries.
+type CurateUsageError struct {
+	Usage CurateUsage
+	Err   error
+}
 
-func (e *CurateAttemptError) Unwrap() error { return e.Err }
+func (e *CurateUsageError) Error() string { return e.Err.Error() }
+
+func (e *CurateUsageError) Unwrap() error { return e.Err }
 
 // CurateMutation specifies one state transition cited back to pending inbox items.
 type CurateMutation struct {
