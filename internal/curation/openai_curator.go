@@ -201,7 +201,7 @@ func (c *OpenAICurator) CurateBatch(ctx context.Context, req CurateRequest) (Cur
 
 	content, promptTok, completionTok, err := c.invokeAndDecode(reqCtx, messages)
 	if err != nil {
-		return CuratePlan{}, err
+		return CuratePlan{}, c.attemptError(promptTok, completionTok, err)
 	}
 
 	plan, valErr := c.compileAndValidate(req, aliases, content, promptTok, completionTok)
@@ -228,18 +228,32 @@ func (c *OpenAICurator) CurateBatch(ctx context.Context, req CurateRequest) (Cur
 			{Role: "user", Content: repairPrompt},
 		}
 		rContent, rPromptTok, rCompTok, rErr := c.invokeAndDecode(reqCtx, repairMsgs)
-		if rErr != nil {
-			return CuratePlan{}, rErr
-		}
 		promptTok += rPromptTok
 		completionTok += rCompTok
+		if rErr != nil {
+			return CuratePlan{}, c.attemptError(promptTok, completionTok, rErr)
+		}
 		plan, valErr = c.compileAndValidate(req, aliases, rContent, promptTok, completionTok)
 		if valErr == nil {
 			return plan, nil
 		}
 	}
 
-	return CuratePlan{}, valErr
+	return CuratePlan{}, c.attemptError(promptTok, completionTok, valErr)
+}
+
+// attemptError attaches tokens the provider already billed to a CurateBatch failure.
+func (c *OpenAICurator) attemptError(promptTok, completionTok int, err error) error {
+	if promptTok == 0 && completionTok == 0 {
+		return err
+	}
+	return &CurateAttemptError{
+		ProviderName:     c.providerName,
+		ModelName:        c.model,
+		PromptTokens:     promptTok,
+		CompletionTokens: completionTok,
+		Err:              err,
+	}
 }
 
 func (c *OpenAICurator) compileAndValidate(
@@ -303,7 +317,7 @@ func (c *OpenAICurator) invokeAndDecode(ctx context.Context, messages []chatMess
 		return "", 0, 0, fmt.Errorf("%w: decode response envelope: %v", ErrMalformedPlan, err)
 	}
 	if len(decoded.Choices) == 0 || strings.TrimSpace(decoded.Choices[0].Message.Content) == "" {
-		return "", 0, 0, fmt.Errorf("%w: missing choices content", ErrMalformedPlan)
+		return "", decoded.Usage.PromptTokens, decoded.Usage.CompletionTokens, fmt.Errorf("%w: missing choices content", ErrMalformedPlan)
 	}
 	return decoded.Choices[0].Message.Content, decoded.Usage.PromptTokens, decoded.Usage.CompletionTokens, nil
 }

@@ -579,6 +579,20 @@ type CuratePlan struct {
 	Mutations        []CurateMutation `json:"mutations"`
 }
 
+// CurateAttemptError is a failed CurateBatch call that had already consumed provider tokens,
+// so the worker can account for usage that no curation_decisions row will carry.
+type CurateAttemptError struct {
+	ProviderName     string
+	ModelName        string
+	PromptTokens     int
+	CompletionTokens int
+	Err              error
+}
+
+func (e *CurateAttemptError) Error() string { return e.Err.Error() }
+
+func (e *CurateAttemptError) Unwrap() error { return e.Err }
+
 // CurateMutation specifies one state transition cited back to pending inbox items.
 type CurateMutation struct {
 	InboxIDs       []uuid.UUID `json:"inbox_ids"`

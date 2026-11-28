@@ -388,6 +388,11 @@ func (w *CurateWorkspaceWorker) processBatch(
 
 	plan, err := w.deps.Curator.CurateBatch(ctx, req)
 	if err != nil {
+		var attemptErr *CurateAttemptError
+		if errors.As(err, &attemptErr) {
+			w.logUnbilledUsage(snap.workspace.WorkspaceID, attemptErr.ProviderName, attemptErr.ModelName, attemptErr.PromptTokens, attemptErr.CompletionTokens,
+				"attempt", job.Attempt, "max_attempts", job.MaxAttempts, "inbox_items", len(subItems), "err", err)
+		}
 		if !errors.Is(err, ErrPlanValidation) {
 			// Transient provider / HTTP / network error.
 			openedNow := w.deps.CuratorBreaker.RecordFailure(err)
@@ -415,11 +420,28 @@ func (w *CurateWorkspaceWorker) processBatch(
 		ExistingEdges:    snap.existingEdges,
 	}
 	if err := ValidatePlan(vctx, plan); err != nil {
+		w.logUnbilledUsage(snap.workspace.WorkspaceID, plan.ProviderName, plan.ModelName, plan.PromptTokens, plan.CompletionTokens,
+			"attempt", job.Attempt, "max_attempts", job.MaxAttempts, "inbox_items", len(subItems), "err", err)
 		return w.handleValidationFailure(ctx, job, snap, subItems, queryVec, err)
 	}
 
 	// Phase C: Serialized commit inside workspace FOR UPDATE lock.
 	return w.commitPhaseC(ctx, snap, subItems, plan)
+}
+
+// logUnbilledUsage records curator tokens that no committed curation_decisions row carries,
+// such as a failed attempt before River retries or dead-letters it.
+func (w *CurateWorkspaceWorker) logUnbilledUsage(wsID, provider, model string, promptTokens, completionTokens int, attrs ...any) {
+	if promptTokens == 0 && completionTokens == 0 {
+		return
+	}
+	w.deps.Logger.Warn("curator tokens not billed to curation_decisions", append([]any{
+		"workspace_id", wsID,
+		"provider", provider,
+		"model", model,
+		"prompt_tokens", promptTokens,
+		"completion_tokens", completionTokens,
+	}, attrs...)...)
 }
 
 func (w *CurateWorkspaceWorker) handleValidationFailure(
@@ -484,8 +506,32 @@ func (w *CurateWorkspaceWorker) runFallbackAndCheckRemaining(ctx context.Context
 	return tx.Commit(ctx)
 }
 
-func (w *CurateWorkspaceWorker) commitPhaseC(ctx context.Context, snap phaseASnapshot, subItems []storage.InboxItem, plan CuratePlan) error {
+// batchUsage bills one curator call to exactly one curation_decisions row. The first row
+// whose savepoint commits carries the call's full usage and every other row carries zero,
+// so SUM(prompt_tokens) over a batch equals the provider-reported usage.
+type batchUsage struct {
+	promptTokens     int
+	completionTokens int
+	billed           bool
+}
+
+// next returns the usage to stamp on the next decision row of the batch.
+func (u *batchUsage) next() (promptTokens, completionTokens int) {
+	if u.billed {
+		return 0, 0
+	}
+	return u.promptTokens, u.completionTokens
+}
+
+func (w *CurateWorkspaceWorker) commitPhaseC(ctx context.Context, snap phaseASnapshot, subItems []storage.InboxItem, plan CuratePlan) (err error) {
 	wsID := snap.workspace.WorkspaceID
+	usage := batchUsage{promptTokens: plan.PromptTokens, completionTokens: plan.CompletionTokens}
+	defer func() {
+		if err != nil || !usage.billed {
+			w.logUnbilledUsage(wsID, plan.ProviderName, plan.ModelName, plan.PromptTokens, plan.CompletionTokens,
+				"inbox_items", len(subItems), "err", err)
+		}
+	}()
 	subByID := make(map[uuid.UUID]storage.InboxItem, len(subItems))
 	subIDList := make([]uuid.UUID, len(subItems))
 	for i, it := range subItems {
@@ -552,6 +598,7 @@ func (w *CurateWorkspaceWorker) commitPhaseC(ctx context.Context, snap phaseASna
 			targetVer   *int
 			changedMem  *storage.Memory
 		)
+		promptTokens, completionTokens := usage.next()
 
 		var mutErr error
 		switch mut.Action {
@@ -562,8 +609,8 @@ func (w *CurateWorkspaceWorker) commitPhaseC(ctx context.Context, snap phaseASna
 				Action:           "noop",
 				ProviderName:     plan.ProviderName,
 				ModelName:        plan.ModelName,
-				PromptTokens:     plan.PromptTokens,
-				CompletionTokens: plan.CompletionTokens,
+				PromptTokens:     promptTokens,
+				CompletionTokens: completionTokens,
 				Rationale:        mut.Rationale,
 			})
 
@@ -598,8 +645,8 @@ func (w *CurateWorkspaceWorker) commitPhaseC(ctx context.Context, snap phaseASna
 					TargetVersion:    targetVer,
 					ProviderName:     plan.ProviderName,
 					ModelName:        plan.ModelName,
-					PromptTokens:     plan.PromptTokens,
-					CompletionTokens: plan.CompletionTokens,
+					PromptTokens:     promptTokens,
+					CompletionTokens: completionTokens,
 					Rationale:        mut.Rationale,
 				})
 			}
@@ -640,8 +687,8 @@ func (w *CurateWorkspaceWorker) commitPhaseC(ctx context.Context, snap phaseASna
 					TargetVersion:    targetVer,
 					ProviderName:     plan.ProviderName,
 					ModelName:        plan.ModelName,
-					PromptTokens:     plan.PromptTokens,
-					CompletionTokens: plan.CompletionTokens,
+					PromptTokens:     promptTokens,
+					CompletionTokens: completionTokens,
 					Rationale:        mut.Rationale,
 				})
 			}
@@ -680,8 +727,8 @@ func (w *CurateWorkspaceWorker) commitPhaseC(ctx context.Context, snap phaseASna
 					TargetVersion:    targetVer,
 					ProviderName:     plan.ProviderName,
 					ModelName:        plan.ModelName,
-					PromptTokens:     plan.PromptTokens,
-					CompletionTokens: plan.CompletionTokens,
+					PromptTokens:     promptTokens,
+					CompletionTokens: completionTokens,
 					Rationale:        mut.Rationale,
 				})
 			}
@@ -706,8 +753,8 @@ func (w *CurateWorkspaceWorker) commitPhaseC(ctx context.Context, snap phaseASna
 					TargetVersion:    targetVer,
 					ProviderName:     plan.ProviderName,
 					ModelName:        plan.ModelName,
-					PromptTokens:     plan.PromptTokens,
-					CompletionTokens: plan.CompletionTokens,
+					PromptTokens:     promptTokens,
+					CompletionTokens: completionTokens,
 					Rationale:        mut.Rationale,
 				})
 			}
@@ -739,6 +786,7 @@ func (w *CurateWorkspaceWorker) commitPhaseC(ctx context.Context, snap phaseASna
 		if err := sp.Commit(ctx); err != nil {
 			return fmt.Errorf("commit mutation savepoint: %w", err)
 		}
+		usage.billed = true
 
 		if mut.Action != ActionNoop {
 			manifestMut = true
