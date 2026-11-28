@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -147,7 +148,13 @@ func (w *CurateWorkspaceWorker) Work(ctx context.Context, job *river.Job[storage
 }
 
 func (w *CurateWorkspaceWorker) preTxEmbedPending(ctx context.Context, wsID string) []float32 {
-	if w.deps.Embedder == nil || !w.deps.EmbedderBreaker.Allow() {
+	if w.deps.Embedder == nil {
+		return nil
+	}
+	call := embedding.EmbedCall{Caller: "curation_candidates", WorkspaceID: wsID, SpaceID: w.deps.Embedder.SpaceID()}
+	if !w.deps.EmbedderBreaker.Allow() {
+		call.Outcome = embedding.EmbedOutcomeBreakerOpen
+		call.Log(w.deps.Logger)
 		return nil
 	}
 	pending, err := storage.ClaimPendingBatch(ctx, w.deps.Store.CurationPool, wsID, maxClaimItems, maxClaimBytes)
@@ -168,12 +175,19 @@ func (w *CurateWorkspaceWorker) preTxEmbedPending(ctx context.Context, wsID stri
 	if len(q) > 2000 {
 		q = q[:2000]
 	}
+	call.InputChars = utf8.RuneCountInString(q)
+	start := time.Now()
 	vecs, err := w.deps.Embedder.EmbedBatch(ctx, []string{q})
+	call.Duration = time.Since(start)
 	if err != nil {
+		call.Outcome = embedding.EmbedOutcomeError
+		call.Log(w.deps.Logger)
 		w.deps.EmbedderBreaker.RecordFailure(err)
 		w.deps.Logger.Debug("pre-tx candidate embedding failed; using lexical fallback", "workspace_id", wsID, "err", err)
 		return nil
 	}
+	call.Outcome = embedding.EmbedOutcomeOK
+	call.Log(w.deps.Logger)
 	w.deps.EmbedderBreaker.RecordSuccess()
 	if len(vecs) == 0 {
 		return nil
@@ -916,7 +930,10 @@ func (w *EmbedMemoryWorker) Work(ctx context.Context, job *river.Job[storage.Emb
 	if w.deps.Embedder == nil {
 		return nil
 	}
+	call := embedding.EmbedCall{Caller: "worker", WorkspaceID: job.Args.WorkspaceID, SpaceID: w.deps.Embedder.SpaceID()}
 	if !w.deps.EmbedderBreaker.Allow() {
+		call.Outcome = embedding.EmbedOutcomeBreakerOpen
+		call.Log(w.deps.Logger)
 		return river.JobSnooze(15 * time.Second)
 	}
 
@@ -932,11 +949,18 @@ func (w *EmbedMemoryWorker) Work(ctx context.Context, job *river.Job[storage.Emb
 	}
 
 	text := embedding.FormatMemoryText(mem.TopicKey, mem.SummaryStub, mem.Body)
+	call.InputChars = utf8.RuneCountInString(text)
+	start := time.Now()
 	vecs, err := w.deps.Embedder.EmbedBatch(ctx, []string{text})
+	call.Duration = time.Since(start)
 	if err != nil {
+		call.Outcome = embedding.EmbedOutcomeError
+		call.Log(w.deps.Logger)
 		w.deps.EmbedderBreaker.RecordFailure(err)
 		return err
 	}
+	call.Outcome = embedding.EmbedOutcomeOK
+	call.Log(w.deps.Logger)
 	w.deps.EmbedderBreaker.RecordSuccess()
 	if len(vecs) == 0 {
 		return errors.New("embedder returned empty vector slice")

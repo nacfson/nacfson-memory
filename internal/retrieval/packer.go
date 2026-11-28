@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -118,6 +120,7 @@ type Packer struct {
 	lexical         *search.LexicalSearch
 	depGraph        *graph.DependencyGraph
 	embedTimeout    time.Duration
+	logger          *slog.Logger
 }
 
 // NewPacker builds a Packer.
@@ -151,6 +154,13 @@ func NewPacker(
 	}
 }
 
+// WithLogger sets the logger that receives metadata-only embed_call events for recall query
+// embeddings and returns p. Without it the Packer emits no telemetry.
+func (p *Packer) WithLogger(logger *slog.Logger) *Packer {
+	p.logger = logger
+	return p
+}
+
 // ClampMaxTokens enforces [1, 2000], defaulting <= 0 to 2000.
 func ClampMaxTokens(maxTokens int) int {
 	if maxTokens <= 0 || maxTokens > MaxAgentTokens {
@@ -174,9 +184,13 @@ func (p *Packer) RecallContext(ctx context.Context, req RecallRequest) (RecallRe
 	trimmedQuery := strings.TrimSpace(req.Query)
 	if trimmedQuery != "" && p.embedder != nil {
 		spaceID = p.embedder.SpaceID()
+		call := embedding.EmbedCall{Caller: "recall", WorkspaceID: req.WorkspaceID, SpaceID: spaceID}
+		start := time.Now()
 		if !p.embedderBreaker.Allow() {
 			degraded = true
+			call.Outcome = embedding.EmbedOutcomeBreakerOpen
 		} else {
+			call.InputChars = utf8.RuneCountInString(trimmedQuery)
 			embCtx, cancel := context.WithTimeout(ctx, p.embedTimeout)
 			vecs, err := p.embedder.EmbedBatch(embCtx, []string{trimmedQuery})
 			cancel()
@@ -186,11 +200,15 @@ func (p *Packer) RecallContext(ctx context.Context, req RecallRequest) (RecallRe
 				}
 				p.embedderBreaker.RecordFailure(err)
 				degraded = true
+				call.Outcome = embedding.EmbedOutcomeError
 			} else {
 				p.embedderBreaker.RecordSuccess()
 				queryVec = vecs[0]
+				call.Outcome = embedding.EmbedOutcomeOK
 			}
 		}
+		call.Duration = time.Since(start)
+		call.Log(p.logger)
 	}
 
 	// Step 2: Single-connection pipelined BEGIN READ ONLY recall on ServingPool.

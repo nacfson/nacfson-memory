@@ -163,7 +163,7 @@ func runServe(ctx context.Context, args []string, envLookup func(string) (string
 	defer store.Close()
 
 	logger := slog.New(slog.NewJSONHandler(stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	svc, lx, dg, curBreaker, embBreaker := buildRuntimeService(cfg, store, emb)
+	svc, lx, dg, curBreaker, embBreaker := buildRuntimeService(cfg, store, emb, logger)
 
 	workers := river.NewWorkers()
 	curation.RegisterWorkers(workers, curation.WorkerDeps{
@@ -267,7 +267,7 @@ func runMCPStdio(ctx context.Context, args []string, envLookup func(string) (str
 
 	// Logs must stay strictly on stderr so stdout remains clean JSON-RPC stdio framing.
 	logger := slog.New(slog.NewJSONHandler(stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	svc, _, _, _, _ := buildRuntimeService(cfg, store, emb)
+	svc, _, _, _, _ := buildRuntimeService(cfg, store, emb, nil)
 
 	if err := mcpserver.RunStdio(ctx, svc, logger); err != nil && !errors.Is(err, context.Canceled) {
 		fmt.Fprintf(stderr, "mcp-stdio failed: %v\n", err)
@@ -276,13 +276,15 @@ func runMCPStdio(ctx context.Context, args []string, envLookup func(string) (str
 	return 0
 }
 
-func buildRuntimeService(cfg config.Config, store *storage.Store, emb embedding.Embedder) (*service.MemoryService, *search.LexicalSearch, *graph.DependencyGraph, *curation.Breaker, *curation.Breaker) {
+// buildRuntimeService wires the memory service. telemetry receives the recall path's
+// embed_call events; nil keeps recall silent.
+func buildRuntimeService(cfg config.Config, store *storage.Store, emb embedding.Embedder, telemetry *slog.Logger) (*service.MemoryService, *search.LexicalSearch, *graph.DependencyGraph, *curation.Breaker, *curation.Breaker) {
 	lx := search.NewLexicalSearch()
 	dg := graph.NewDependencyGraph()
 	scrubber := security.NewSecretScrubber()
 	curBreaker := curation.NewBreaker(3, 60*time.Second)
 	embBreaker := curation.NewBreaker(3, 60*time.Second)
-	packer := retrieval.NewPacker(store, emb, embBreaker, lx, dg, cfg.EmbedTimeout)
+	packer := retrieval.NewPacker(store, emb, embBreaker, lx, dg, cfg.EmbedTimeout).WithLogger(telemetry)
 	svc := service.New(cfg, store, scrubber, emb, packer, dg, curBreaker, embBreaker)
 	return svc, lx, dg, curBreaker, embBreaker
 }
