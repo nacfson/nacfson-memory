@@ -95,7 +95,7 @@ Distill inbox turns into structured memory mutations adhering strictly to these 
 1. Reference inbox items using their short refs (e.g. "I1", "I2") in inbox_ids. Every input ref MUST be cited in at least one mutation (use action="noop" for greetings/chitchat/non-durable filler).
 2. Durability: ONLY "durable" or "working". NEVER output durability="constitution".
 3. Reserved workspace "general": ONLY store personal_profile or personal_preference with durability="durable". NEVER store technical, code, API, or workflow_note entries in "general" (emit action="noop" instead).
-4. Project workspaces: use action="create" for new topics, "revise" on existing target_memory_id (short ref from candidates[].ref such as "M1") for additive updates preserving the same premise, "supersede" on existing target_memory_id when replacing/contradicting a previous decision or fact, "retire" on target_memory_id when temporary work is finished. For "create" and "noop", target_memory_id must be null.
+4. Project workspaces: use action="create" for new topics, "revise" on existing target_memory_id (short ref from candidates[].ref such as "M1") for additive updates preserving the same premise, "supersede" on existing target_memory_id when replacing/contradicting a previous decision or fact, "retire" on target_memory_id when temporary work is finished. For "create" and "noop", target_memory_id must be null. Refining the same decision or component is "revise" on it; a downstream component's assumption relying on an upstream decision is a separate "create" topic whose depends_on cites the upstream candidate ref and its integer current_version.
 5. topic_key must match ^[a-z0-9][a-z0-9-]{0,127}$ (lowercase alphanumeric + hyphens; no duplicate create topic_key in one batch).
 6. summary_stub must be <= 180 characters on a single line (no newlines); body must be <= 1500 tokens.
 7. depends_on lists at most 5 edges to active candidates in this workspace and must stay acyclic; use [] when unused. Each edge is an object whose expected_to_rev is that candidate's integer current_version (never true/false); for a candidate M1 whose current_version is 1: {"target_memory_id":"M1","expected_to_rev":1,"rationale":"extends the M1 decision"}.
@@ -199,12 +199,13 @@ func (c *OpenAICurator) CurateBatch(ctx context.Context, req CurateRequest) (Cur
 		{Role: "user", Content: string(userJSON)},
 	}
 
-	content, promptTok, completionTok, err := c.invokeAndDecode(reqCtx, messages)
+	usage := CurateUsage{ProviderName: c.providerName, ModelName: c.model}
+	content, _, err := c.invokeAndDecode(reqCtx, messages, &usage)
 	if err != nil {
-		return CuratePlan{}, c.attemptError(promptTok, completionTok, err)
+		return CuratePlan{}, &CurateUsageError{Usage: usage, Err: err}
 	}
 
-	plan, valErr := c.compileAndValidate(req, aliases, content, promptTok, completionTok)
+	plan, valErr := c.compileAndValidate(req, aliases, content, usage)
 	if valErr == nil {
 		return plan, nil
 	}
@@ -221,64 +222,45 @@ func (c *OpenAICurator) CurateBatch(ctx context.Context, req CurateRequest) (Cur
 			aliases.InboxRefsSummary(),
 			aliases.CandidateRefsSummary(),
 		)
+		if isDependsOnTypeError(valErr) {
+			repairPrompt += " depends_on[].expected_to_rev must be an integer equal to the cited candidate's current_version, never a boolean."
+		}
 		repairMsgs := []chatMessage{
 			messages[0],
 			messages[1],
 			{Role: "assistant", Content: badAssistant},
 			{Role: "user", Content: repairPrompt},
 		}
-		rContent, rPromptTok, rCompTok, rErr := c.invokeAndDecode(reqCtx, repairMsgs)
-		promptTok += rPromptTok
-		completionTok += rCompTok
+		rContent, _, rErr := c.invokeAndDecode(reqCtx, repairMsgs, &usage)
 		if rErr != nil {
-			return CuratePlan{}, c.attemptError(promptTok, completionTok, rErr)
+			return CuratePlan{}, &CurateUsageError{Usage: usage, Err: rErr}
 		}
-		plan, valErr = c.compileAndValidate(req, aliases, rContent, promptTok, completionTok)
+		plan, valErr = c.compileAndValidate(req, aliases, rContent, usage)
 		if valErr == nil {
 			return plan, nil
 		}
 	}
 
-	return CuratePlan{}, c.attemptError(promptTok, completionTok, valErr)
+	return CuratePlan{}, &CurateUsageError{Usage: usage, Err: valErr}
 }
 
-// attemptError attaches tokens the provider already billed to a CurateBatch failure.
-func (c *OpenAICurator) attemptError(promptTok, completionTok int, err error) error {
-	if promptTok == 0 && completionTok == 0 {
-		return err
-	}
-	return &CurateAttemptError{
-		ProviderName:     c.providerName,
-		ModelName:        c.model,
-		PromptTokens:     promptTok,
-		CompletionTokens: completionTok,
-		Err:              err,
-	}
-}
-
-func (c *OpenAICurator) compileAndValidate(
-	req CurateRequest,
-	aliases AliasTable,
-	rawContent string,
-	promptTok, completionTok int,
-) (CuratePlan, error) {
+func (c *OpenAICurator) compileAndValidate(req CurateRequest, aliases AliasTable, rawContent string, usage CurateUsage) (CuratePlan, error) {
 	mutations, err := CompileRawPlan(aliases, rawContent)
 	if err != nil {
 		return CuratePlan{}, err
 	}
-	plan := CuratePlan{
-		ProviderName:     c.providerName,
-		ModelName:        c.model,
-		PromptTokens:     promptTok,
-		CompletionTokens: completionTok,
-		Mutations:        mutations,
-	}
+	plan := CuratePlan{CurateUsage: usage, Mutations: mutations}
 	if len(req.InboxItems) > 0 {
 		if err := ValidatePlan(localValidationContext(req), plan); err != nil {
 			return CuratePlan{}, err
 		}
 	}
 	return plan, nil
+}
+
+func isDependsOnTypeError(err error) bool {
+	var fieldErr *planFieldTypeError
+	return errors.As(err, &fieldErr) && strings.Contains(fieldErr.field, "depends_on")
 }
 
 func localValidationContext(req CurateRequest) ValidationContext {
@@ -299,27 +281,32 @@ func localValidationContext(req CurateRequest) ValidationContext {
 	}
 }
 
-func (c *OpenAICurator) invokeAndDecode(ctx context.Context, messages []chatMessage) (string, int, int, error) {
+// invokeAndDecode issues one chat completion call and adds it to usage. decoded reports
+// whether a 2xx response envelope was decoded, which is when the provider reports usage.
+func (c *OpenAICurator) invokeAndDecode(ctx context.Context, messages []chatMessage, usage *CurateUsage) (content string, decoded bool, err error) {
+	usage.APICalls++
 	status, body, err := c.sendChatWithFormatFallback(ctx, messages)
 	if err != nil {
-		return "", 0, 0, err
+		return "", false, err
 	}
 	if status < 200 || status >= 300 {
 		snippet := strings.TrimSpace(string(body))
 		if len(snippet) > 512 {
 			snippet = snippet[:512] + "..."
 		}
-		return "", 0, 0, fmt.Errorf("curator endpoint returned HTTP %d: %s", status, snippet)
+		return "", false, fmt.Errorf("curator endpoint returned HTTP %d: %s", status, snippet)
 	}
 
-	var decoded chatCompletionResponse
-	if err := json.Unmarshal(body, &decoded); err != nil {
-		return "", 0, 0, fmt.Errorf("%w: decode response envelope: %v", ErrMalformedPlan, err)
+	var resp chatCompletionResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return "", false, fmt.Errorf("%w: decode response envelope: %v", ErrMalformedPlan, err)
 	}
-	if len(decoded.Choices) == 0 || strings.TrimSpace(decoded.Choices[0].Message.Content) == "" {
-		return "", decoded.Usage.PromptTokens, decoded.Usage.CompletionTokens, fmt.Errorf("%w: missing choices content", ErrMalformedPlan)
+	usage.PromptTokens += resp.Usage.PromptTokens
+	usage.CompletionTokens += resp.Usage.CompletionTokens
+	if len(resp.Choices) == 0 || strings.TrimSpace(resp.Choices[0].Message.Content) == "" {
+		return "", true, fmt.Errorf("%w: missing choices content", ErrMalformedPlan)
 	}
-	return decoded.Choices[0].Message.Content, decoded.Usage.PromptTokens, decoded.Usage.CompletionTokens, nil
+	return resp.Choices[0].Message.Content, true, nil
 }
 
 func (c *OpenAICurator) sendChatWithFormatFallback(ctx context.Context, messages []chatMessage) (int, []byte, error) {
@@ -555,9 +542,8 @@ func (m *MockCurator) CurateBatch(ctx context.Context, req CurateRequest) (Curat
 	}
 
 	return CuratePlan{
-		ProviderName: "mock",
-		ModelName:    "mock-curator-v1",
-		Mutations:    mutations,
+		CurateUsage: CurateUsage{ProviderName: "mock", ModelName: "mock-curator-v1"},
+		Mutations:   mutations,
 	}, nil
 }
 

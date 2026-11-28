@@ -133,9 +133,49 @@ func assertDiscardedJobListed(t *testing.T, source string, body []byte, jobID in
 	t.Fatalf("%s: discarded job %d missing from dead-letters report\n%s", source, jobID, body)
 }
 
+// insertDiscardedJob writes a discarded river_job row whose errors column is errorsSQL
+// (for example NULL or '{}'::jsonb[]) and returns its id.
+func insertDiscardedJob(t *testing.T, store *storage.Store, errorsSQL string) int64 {
+	t.Helper()
+	var id int64
+	if err := store.CurationPool.QueryRow(context.Background(), `
+		INSERT INTO river_job (state, attempt, max_attempts, kind, queue, args, errors, finalized_at)
+		VALUES ('discarded', 1, 1, 'test_no_errors', 'default', '{}', `+errorsSQL+`, now())
+		RETURNING id
+	`).Scan(&id); err != nil {
+		t.Fatalf("insert discarded job with errors=%s: %v", errorsSQL, err)
+	}
+	return id
+}
+
+// assertEmptyErrorsArray checks that job jobID serializes "errors" as a present, empty JSON array.
+func assertEmptyErrorsArray(t *testing.T, source string, body []byte, jobID int64) {
+	t.Helper()
+	var rep struct {
+		DiscardedJobs []map[string]json.RawMessage `json:"discarded_jobs"`
+	}
+	if err := json.Unmarshal(body, &rep); err != nil {
+		t.Fatalf("%s: decode dead-letters JSON: %v\n%s", source, err, body)
+	}
+	for _, job := range rep.DiscardedJobs {
+		var id int64
+		if err := json.Unmarshal(job["id"], &id); err != nil || id != jobID {
+			continue
+		}
+		raw, present := job["errors"]
+		if !present || string(raw) != "[]" {
+			t.Fatalf("%s: discarded job %d errors = %q (present=%v), want []\n%s", source, jobID, raw, present, body)
+		}
+		return
+	}
+	t.Fatalf("%s: discarded job %d missing from dead-letters report\n%s", source, jobID, body)
+}
+
 func TestDeadLettersListsDiscardedRiverJobOverHTTPAndCLI(t *testing.T) {
 	store := testutil.OpenTestDB(t)
 	jobID := discardRiverJob(t, store)
+	emptyErrorsJob := insertDiscardedJob(t, store, `'{}'::jsonb[]`)
+	nullErrorsJob := insertDiscardedJob(t, store, `NULL`)
 
 	cfg := config.Config{
 		AllowedHosts:      []string{"127.0.0.1", "localhost", "[::1]"},
@@ -175,6 +215,8 @@ func TestDeadLettersListsDiscardedRiverJobOverHTTPAndCLI(t *testing.T) {
 		t.Fatalf("GET /v1/ops/dead-letters status=%d body=%s", resp.StatusCode, body)
 	}
 	assertDiscardedJobListed(t, "GET /v1/ops/dead-letters", body, jobID)
+	assertEmptyErrorsArray(t, "GET /v1/ops/dead-letters", body, emptyErrorsJob)
+	assertEmptyErrorsArray(t, "GET /v1/ops/dead-letters", body, nullErrorsJob)
 
 	t.Setenv("MEM1_ADMIN_TOKEN", cfg.AdminToken)
 	t.Setenv("MEM1_HTTP_ADDR", srv.URL)
@@ -183,4 +225,6 @@ func TestDeadLettersListsDiscardedRiverJobOverHTTPAndCLI(t *testing.T) {
 		t.Fatalf("mem1 dead-letters exit=%d stderr=%s", code, errBuf.String())
 	}
 	assertDiscardedJobListed(t, "mem1 dead-letters", out.Bytes(), jobID)
+	assertEmptyErrorsArray(t, "mem1 dead-letters", out.Bytes(), emptyErrorsJob)
+	assertEmptyErrorsArray(t, "mem1 dead-letters", out.Bytes(), nullErrorsJob)
 }

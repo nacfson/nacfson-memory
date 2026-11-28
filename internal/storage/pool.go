@@ -79,7 +79,7 @@ type DiscardedRiverJob struct {
 	Queue       string            `json:"queue"`
 	Attempt     int               `json:"attempt"`
 	Args        json.RawMessage   `json:"args"`
-	Errors      []json.RawMessage `json:"errors,omitempty"`
+	Errors      []json.RawMessage `json:"errors"`
 	FinalizedAt *time.Time        `json:"finalized_at,omitempty"`
 }
 
@@ -413,7 +413,7 @@ func (s *Store) ListDeadLetters(ctx context.Context, limit int) (DeadLettersRepo
 	}
 
 	jobRows, err := s.CurationPool.Query(ctx, `
-		SELECT id, kind, queue, attempt, args, errors, finalized_at
+		SELECT id, kind, queue, attempt, args, COALESCE(errors, '{}'::jsonb[]), finalized_at
 		FROM river_job
 		WHERE state = 'discarded'
 		ORDER BY id DESC

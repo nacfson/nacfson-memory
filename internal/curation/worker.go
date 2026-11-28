@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -147,7 +148,13 @@ func (w *CurateWorkspaceWorker) Work(ctx context.Context, job *river.Job[storage
 }
 
 func (w *CurateWorkspaceWorker) preTxEmbedPending(ctx context.Context, wsID string) []float32 {
-	if w.deps.Embedder == nil || !w.deps.EmbedderBreaker.Allow() {
+	if w.deps.Embedder == nil {
+		return nil
+	}
+	call := embedding.EmbedCall{Caller: "curation_candidates", WorkspaceID: wsID, SpaceID: w.deps.Embedder.SpaceID()}
+	if !w.deps.EmbedderBreaker.Allow() {
+		call.Outcome = embedding.EmbedOutcomeBreakerOpen
+		call.Log(w.deps.Logger)
 		return nil
 	}
 	pending, err := storage.ClaimPendingBatch(ctx, w.deps.Store.CurationPool, wsID, maxClaimItems, maxClaimBytes)
@@ -168,12 +175,19 @@ func (w *CurateWorkspaceWorker) preTxEmbedPending(ctx context.Context, wsID stri
 	if len(q) > 2000 {
 		q = q[:2000]
 	}
+	call.InputChars = utf8.RuneCountInString(q)
+	start := time.Now()
 	vecs, err := w.deps.Embedder.EmbedBatch(ctx, []string{q})
+	call.Duration = time.Since(start)
 	if err != nil {
+		call.Outcome = embedding.EmbedOutcomeError
+		call.Log(w.deps.Logger)
 		w.deps.EmbedderBreaker.RecordFailure(err)
 		w.deps.Logger.Debug("pre-tx candidate embedding failed; using lexical fallback", "workspace_id", wsID, "err", err)
 		return nil
 	}
+	call.Outcome = embedding.EmbedOutcomeOK
+	call.Log(w.deps.Logger)
 	w.deps.EmbedderBreaker.RecordSuccess()
 	if len(vecs) == 0 {
 		return nil
@@ -386,22 +400,46 @@ func (w *CurateWorkspaceWorker) processBatch(
 		Candidates:      snap.candidates,
 	}
 
+	start := time.Now()
 	plan, err := w.deps.Curator.CurateBatch(ctx, req)
+	elapsed := time.Since(start)
+	// logLLMCall emits the one metadata-only curation_llm_call event of this CurateBatch call.
+	// It must never carry inbox content, plan text, topic keys, or error strings.
+	logLLMCall := func(outcome string, usage CurateUsage, mutations int) {
+		w.deps.Logger.Info("curation_llm_call",
+			"workspace_id", snap.workspace.WorkspaceID,
+			"provider", usage.ProviderName,
+			"model", usage.ModelName,
+			"attempt", job.Attempt,
+			"batch_size", len(subItems),
+			"mutations", mutations,
+			"prompt_tokens", usage.PromptTokens,
+			"completion_tokens", usage.CompletionTokens,
+			"api_calls", usage.APICalls,
+			"outcome", outcome,
+			"duration_ms", elapsed.Milliseconds(),
+		)
+	}
 	if err != nil {
-		var attemptErr *CurateAttemptError
-		if errors.As(err, &attemptErr) {
-			w.logUnbilledUsage(snap.workspace.WorkspaceID, attemptErr.ProviderName, attemptErr.ModelName, attemptErr.PromptTokens, attemptErr.CompletionTokens,
-				"attempt", job.Attempt, "max_attempts", job.MaxAttempts, "inbox_items", len(subItems), "err", err)
+		var (
+			usage    CurateUsage
+			usageErr *CurateUsageError
+		)
+		if errors.As(err, &usageErr) {
+			usage = usageErr.Usage
 		}
 		if !errors.Is(err, ErrPlanValidation) {
 			// Transient provider / HTTP / network error.
 			openedNow := w.deps.CuratorBreaker.RecordFailure(err)
 			if openedNow || job.Attempt >= job.MaxAttempts {
+				logLLMCall("provisional_fallback", usage, 0)
 				return w.runFallbackAndCheckRemaining(ctx, snap.workspace.WorkspaceID, subItems, fmt.Sprintf("curator error fallback (attempt %d): %v", job.Attempt, err))
 			}
+			logLLMCall("provider_error", usage, 0)
 			return err
 		}
 		// Malformed plan falls through to recursive bisection.
+		logLLMCall("validation_failed", usage, 0)
 		return w.handleValidationFailure(ctx, job, snap, subItems, queryVec, err)
 	}
 
@@ -420,28 +458,13 @@ func (w *CurateWorkspaceWorker) processBatch(
 		ExistingEdges:    snap.existingEdges,
 	}
 	if err := ValidatePlan(vctx, plan); err != nil {
-		w.logUnbilledUsage(snap.workspace.WorkspaceID, plan.ProviderName, plan.ModelName, plan.PromptTokens, plan.CompletionTokens,
-			"attempt", job.Attempt, "max_attempts", job.MaxAttempts, "inbox_items", len(subItems), "err", err)
+		logLLMCall("validation_failed", plan.CurateUsage, len(plan.Mutations))
 		return w.handleValidationFailure(ctx, job, snap, subItems, queryVec, err)
 	}
+	logLLMCall("ok", plan.CurateUsage, len(plan.Mutations))
 
 	// Phase C: Serialized commit inside workspace FOR UPDATE lock.
 	return w.commitPhaseC(ctx, snap, subItems, plan)
-}
-
-// logUnbilledUsage records curator tokens that no committed curation_decisions row carries,
-// such as a failed attempt before River retries or dead-letters it.
-func (w *CurateWorkspaceWorker) logUnbilledUsage(wsID, provider, model string, promptTokens, completionTokens int, attrs ...any) {
-	if promptTokens == 0 && completionTokens == 0 {
-		return
-	}
-	w.deps.Logger.Warn("curator tokens not billed to curation_decisions", append([]any{
-		"workspace_id", wsID,
-		"provider", provider,
-		"model", model,
-		"prompt_tokens", promptTokens,
-		"completion_tokens", completionTokens,
-	}, attrs...)...)
 }
 
 func (w *CurateWorkspaceWorker) handleValidationFailure(
@@ -523,15 +546,9 @@ func (u *batchUsage) next() (promptTokens, completionTokens int) {
 	return u.promptTokens, u.completionTokens
 }
 
-func (w *CurateWorkspaceWorker) commitPhaseC(ctx context.Context, snap phaseASnapshot, subItems []storage.InboxItem, plan CuratePlan) (err error) {
+func (w *CurateWorkspaceWorker) commitPhaseC(ctx context.Context, snap phaseASnapshot, subItems []storage.InboxItem, plan CuratePlan) error {
 	wsID := snap.workspace.WorkspaceID
 	usage := batchUsage{promptTokens: plan.PromptTokens, completionTokens: plan.CompletionTokens}
-	defer func() {
-		if err != nil || !usage.billed {
-			w.logUnbilledUsage(wsID, plan.ProviderName, plan.ModelName, plan.PromptTokens, plan.CompletionTokens,
-				"inbox_items", len(subItems), "err", err)
-		}
-	}()
 	subByID := make(map[uuid.UUID]storage.InboxItem, len(subItems))
 	subIDList := make([]uuid.UUID, len(subItems))
 	for i, it := range subItems {
@@ -913,7 +930,10 @@ func (w *EmbedMemoryWorker) Work(ctx context.Context, job *river.Job[storage.Emb
 	if w.deps.Embedder == nil {
 		return nil
 	}
+	call := embedding.EmbedCall{Caller: "worker", WorkspaceID: job.Args.WorkspaceID, SpaceID: w.deps.Embedder.SpaceID()}
 	if !w.deps.EmbedderBreaker.Allow() {
+		call.Outcome = embedding.EmbedOutcomeBreakerOpen
+		call.Log(w.deps.Logger)
 		return river.JobSnooze(15 * time.Second)
 	}
 
@@ -929,11 +949,18 @@ func (w *EmbedMemoryWorker) Work(ctx context.Context, job *river.Job[storage.Emb
 	}
 
 	text := embedding.FormatMemoryText(mem.TopicKey, mem.SummaryStub, mem.Body)
+	call.InputChars = utf8.RuneCountInString(text)
+	start := time.Now()
 	vecs, err := w.deps.Embedder.EmbedBatch(ctx, []string{text})
+	call.Duration = time.Since(start)
 	if err != nil {
+		call.Outcome = embedding.EmbedOutcomeError
+		call.Log(w.deps.Logger)
 		w.deps.EmbedderBreaker.RecordFailure(err)
 		return err
 	}
+	call.Outcome = embedding.EmbedOutcomeOK
+	call.Log(w.deps.Logger)
 	w.deps.EmbedderBreaker.RecordSuccess()
 	if len(vecs) == 0 {
 		return errors.New("embedder returned empty vector slice")
