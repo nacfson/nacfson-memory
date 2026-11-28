@@ -4,6 +4,7 @@ package storage_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -893,6 +894,12 @@ func TestStorageEdgePathsPaginationAndJobs(t *testing.T) {
 	dl, err := store.ListDeadLetters(ctx, 200)
 	if err != nil || len(dl.DiscardedJobs) != 1 || dl.DiscardedJobs[0].Kind != "curate_workspace" {
 		t.Fatalf("expected 1 discarded river job, got %+v err=%v", dl, err)
+	}
+	if errs := dl.DiscardedJobs[0].Errors; errs == nil || len(errs) != 0 {
+		t.Fatalf("discarded job with NULL errors must list an empty, non-nil Errors slice, got %#v", errs)
+	}
+	if wire, err := json.Marshal(dl.DiscardedJobs[0]); err != nil || !strings.Contains(string(wire), `"errors":[]`) {
+		t.Fatalf("discarded job with NULL errors must serialize errors as [], got %s err=%v", wire, err)
 	}
 	if err := storage.MarkInboxDeadLetter(ctx, store.CurationPool, "wsedge", uuid.New(), "missing"); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound dead-lettering missing inbox item, got %v", err)
