@@ -57,6 +57,7 @@ func startRiverWorkers(t *testing.T, store *storage.Store, deps curation.WorkerD
 		RetryPolicy:       fastRetryPolicy{},
 		FetchCooldown:     20 * time.Millisecond,
 		FetchPollInterval: 50 * time.Millisecond,
+		Logger:            deps.Logger,
 		TestOnly:          true,
 	})
 	if err != nil {
