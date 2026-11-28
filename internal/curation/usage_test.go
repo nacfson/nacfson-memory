@@ -125,16 +125,31 @@ func TestOpenAICuratorFailedAttemptCarriesBilledUsage(t *testing.T) {
 	}
 }
 
-func TestOpenAICuratorFailureWithoutDecodedResponseCarriesNoUsage(t *testing.T) {
+func TestOpenAICuratorFailureWithoutDecodedResponseCarriesAttribution(t *testing.T) {
 	srv := scriptedProvider(t, providerReply{status: http.StatusServiceUnavailable})
-	cur, err := NewOpenAICurator(OpenAICuratorConfig{BaseURL: srv.URL, Model: "deepseek-chat", Timeout: 3 * time.Second})
+	cur, err := NewOpenAICurator(OpenAICuratorConfig{
+		BaseURL:      srv.URL,
+		Model:        "deepseek-chat",
+		ProviderName: "deepseek",
+		Timeout:      3 * time.Second,
+	})
 	if err != nil {
 		t.Fatalf("new curator: %v", err)
 	}
 	_, err = cur.CurateBatch(context.Background(), usageTestRequest())
+	if err == nil {
+		t.Fatal("expected CurateBatch to fail on HTTP 503")
+	}
+	if errors.Is(err, ErrPlanValidation) {
+		t.Fatalf("HTTP 503 must not match ErrPlanValidation, got %v", err)
+	}
 	var usageErr *CurateUsageError
-	if err == nil || errors.As(err, &usageErr) {
-		t.Fatalf("HTTP 503 with no decoded body must fail without usage, got %v", err)
+	if !errors.As(err, &usageErr) {
+		t.Fatalf("HTTP 503 failure must carry attribution as *CurateUsageError, got %T: %v", err, err)
+	}
+	want := CurateUsage{ProviderName: "deepseek", ModelName: "deepseek-chat", APICalls: 1}
+	if usageErr.Usage != want {
+		t.Fatalf("usage = %+v, want %+v", usageErr.Usage, want)
 	}
 }
 

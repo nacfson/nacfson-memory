@@ -200,11 +200,8 @@ func (c *OpenAICurator) CurateBatch(ctx context.Context, req CurateRequest) (Cur
 	}
 
 	usage := CurateUsage{ProviderName: c.providerName, ModelName: c.model}
-	content, decoded, err := c.invokeAndDecode(reqCtx, messages, &usage)
+	content, _, err := c.invokeAndDecode(reqCtx, messages, &usage)
 	if err != nil {
-		if !decoded {
-			return CuratePlan{}, err
-		}
 		return CuratePlan{}, &CurateUsageError{Usage: usage, Err: err}
 	}
 
