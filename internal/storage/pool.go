@@ -71,15 +71,16 @@ type DeadLetterInboxItem struct {
 	ContentPreview string    `json:"content_preview"`
 }
 
-// DiscardedRiverJob describes one discarded job in river_job.
+// DiscardedRiverJob describes one discarded job in river_job. Errors mirrors River's
+// jsonb[] errors column: one JSON object per failed attempt.
 type DiscardedRiverJob struct {
-	ID          int64           `json:"id"`
-	Kind        string          `json:"kind"`
-	Queue       string          `json:"queue"`
-	Attempt     int             `json:"attempt"`
-	Args        json.RawMessage `json:"args"`
-	Errors      json.RawMessage `json:"errors,omitempty"`
-	FinalizedAt *time.Time      `json:"finalized_at,omitempty"`
+	ID          int64             `json:"id"`
+	Kind        string            `json:"kind"`
+	Queue       string            `json:"queue"`
+	Attempt     int               `json:"attempt"`
+	Args        json.RawMessage   `json:"args"`
+	Errors      []json.RawMessage `json:"errors,omitempty"`
+	FinalizedAt *time.Time        `json:"finalized_at,omitempty"`
 }
 
 // DeadLettersReport combines dead-letter inbox items and discarded River jobs.
