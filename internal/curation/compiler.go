@@ -2,7 +2,9 @@ package curation
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -271,6 +273,10 @@ func CompileRawPlan(aliases AliasTable, rawContent string) ([]CurateMutation, er
 	cleaned := stripMarkdownCodeFence(rawContent)
 	var rawPlan rawPlanPayload
 	if err := json.Unmarshal([]byte(cleaned), &rawPlan); err != nil {
+		var typeErr *json.UnmarshalTypeError
+		if errors.As(err, &typeErr) && typeErr.Field != "" {
+			return nil, fmt.Errorf("%w: field %s must be %s, got %s", ErrMalformedPlan, typeErr.Field, jsonTypeName(typeErr.Type), typeErr.Value)
+		}
 		return nil, fmt.Errorf("%w: decode mutations JSON: %v", ErrMalformedPlan, err)
 	}
 	if rawPlan.Mutations == nil {
@@ -434,6 +440,22 @@ func CompileRawPlan(aliases AliasTable, rawContent string) ([]CurateMutation, er
 	}
 
 	return mutations, nil
+}
+
+// jsonTypeName names the JSON type expected by a rawPlanPayload field kind.
+func jsonTypeName(t reflect.Type) string {
+	switch t.Kind() {
+	case reflect.Int:
+		return "an integer"
+	case reflect.String:
+		return "a string"
+	case reflect.Slice:
+		return "an array"
+	case reflect.Pointer:
+		return jsonTypeName(t.Elem()) + " or null"
+	default:
+		return "an object"
+	}
 }
 
 func defaultProjectCategory(category, durability string, isGeneral bool) string {

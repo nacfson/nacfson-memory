@@ -98,7 +98,7 @@ Distill inbox turns into structured memory mutations adhering strictly to these 
 4. Project workspaces: use action="create" for new topics, "revise" on existing target_memory_id (short ref from candidates[].ref such as "M1") for additive updates preserving the same premise, "supersede" on existing target_memory_id when replacing/contradicting a previous decision or fact, "retire" on target_memory_id when temporary work is finished. For "create" and "noop", target_memory_id must be null.
 5. topic_key must match ^[a-z0-9][a-z0-9-]{0,127}$ (lowercase alphanumeric + hyphens; no duplicate create topic_key in one batch).
 6. summary_stub must be <= 180 characters on a single line (no newlines); body must be <= 1500 tokens.
-7. depends_on (max 5 intra-workspace active candidate refs like "M1", expected_to_rev, rationale) must stay acyclic; use [] when unused.
+7. depends_on lists at most 5 edges to active candidates in this workspace and must stay acyclic; use [] when unused. Each edge is an object whose expected_to_rev is that candidate's integer current_version (never true/false); for a candidate M1 whose current_version is 1: {"target_memory_id":"M1","expected_to_rev":1,"rationale":"extends the M1 decision"}.
 8. For action="noop", set durability="", topic_key="", summary_stub="", body="", target_memory_id=null, depends_on=[].
 Return strictly valid json matching this object shape:
 {"mutations":[{"inbox_ids":["I1"],"action":"create|revise|supersede|retire|noop","category":"personal_profile|personal_preference|project_technical|workflow_note","target_memory_id":null,"durability":"durable|working","topic_key":"lowercase-slug","summary_stub":"single line <= 180 chars","body":"<= 1500 tokens","depends_on":[],"rationale":"short reason"}]}`
