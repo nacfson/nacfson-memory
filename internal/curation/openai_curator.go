@@ -95,7 +95,7 @@ Distill inbox turns into structured memory mutations adhering strictly to these 
 1. Reference inbox items using their short refs (e.g. "I1", "I2") in inbox_ids. Every input ref MUST be cited in at least one mutation (use action="noop" for greetings/chitchat/non-durable filler).
 2. Durability: ONLY "durable" or "working". NEVER output durability="constitution".
 3. Reserved workspace "general": ONLY store personal_profile or personal_preference with durability="durable". NEVER store technical, code, API, or workflow_note entries in "general" (emit action="noop" instead).
-4. Project workspaces: use action="create" for new topics, "revise" on existing target_memory_id (short ref from candidates[].ref such as "M1") for additive updates preserving the same premise, "supersede" on existing target_memory_id when replacing/contradicting a previous decision or fact, "retire" on target_memory_id when temporary work is finished. For "create" and "noop", target_memory_id must be null.
+4. Project workspaces: use action="create" for new topics, "revise" on existing target_memory_id (short ref from candidates[].ref such as "M1") for additive updates preserving the same premise, "supersede" on existing target_memory_id when replacing/contradicting a previous decision or fact, "retire" on target_memory_id when temporary work is finished. For "create" and "noop", target_memory_id must be null. Refining the same decision or component is "revise" on it; a downstream component's assumption relying on an upstream decision is a separate "create" topic whose depends_on cites the upstream candidate ref and its integer current_version.
 5. topic_key must match ^[a-z0-9][a-z0-9-]{0,127}$ (lowercase alphanumeric + hyphens; no duplicate create topic_key in one batch).
 6. summary_stub must be <= 180 characters on a single line (no newlines); body must be <= 1500 tokens.
 7. depends_on lists at most 5 edges to active candidates in this workspace and must stay acyclic; use [] when unused. Each edge is an object whose expected_to_rev is that candidate's integer current_version (never true/false); for a candidate M1 whose current_version is 1: {"target_memory_id":"M1","expected_to_rev":1,"rationale":"extends the M1 decision"}.
@@ -221,6 +221,9 @@ func (c *OpenAICurator) CurateBatch(ctx context.Context, req CurateRequest) (Cur
 			aliases.InboxRefsSummary(),
 			aliases.CandidateRefsSummary(),
 		)
+		if isDependsOnTypeError(valErr) {
+			repairPrompt += " depends_on[].expected_to_rev must be an integer equal to the cited candidate's current_version, never a boolean."
+		}
 		repairMsgs := []chatMessage{
 			messages[0],
 			messages[1],
@@ -279,6 +282,11 @@ func (c *OpenAICurator) compileAndValidate(
 		}
 	}
 	return plan, nil
+}
+
+func isDependsOnTypeError(err error) bool {
+	var fieldErr *planFieldTypeError
+	return errors.As(err, &fieldErr) && strings.Contains(fieldErr.field, "depends_on")
 }
 
 func localValidationContext(req CurateRequest) ValidationContext {

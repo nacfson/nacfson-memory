@@ -266,6 +266,18 @@ type rawMutationPayload struct {
 	Rationale      string           `json:"rationale"`
 }
 
+// planFieldTypeError is a curator output field whose JSON type does not match the plan
+// schema, such as a boolean depends_on[].expected_to_rev.
+type planFieldTypeError struct {
+	field, want, got string
+}
+
+func (e *planFieldTypeError) Error() string {
+	return fmt.Sprintf("%v: field %s must be %s, got %s", ErrMalformedPlan, e.field, e.want, e.got)
+}
+
+func (e *planFieldTypeError) Unwrap() error { return ErrMalformedPlan }
+
 // CompileRawPlan decodes raw LLM JSON (supporting short aliases and shorthand keys),
 // resolves aliases back to exact UUIDs, and deterministically normalizes formatting fields
 // without masking security invariants enforced by ValidatePlan.
@@ -275,7 +287,7 @@ func CompileRawPlan(aliases AliasTable, rawContent string) ([]CurateMutation, er
 	if err := json.Unmarshal([]byte(cleaned), &rawPlan); err != nil {
 		var typeErr *json.UnmarshalTypeError
 		if errors.As(err, &typeErr) && typeErr.Field != "" {
-			return nil, fmt.Errorf("%w: field %s must be %s, got %s", ErrMalformedPlan, typeErr.Field, jsonTypeName(typeErr.Type), typeErr.Value)
+			return nil, &planFieldTypeError{field: typeErr.Field, want: jsonTypeName(typeErr.Type), got: typeErr.Value}
 		}
 		return nil, fmt.Errorf("%w: decode mutations JSON: %v", ErrMalformedPlan, err)
 	}
